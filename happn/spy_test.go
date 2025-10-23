@@ -11,15 +11,15 @@ type TestSubject struct {
 }
 
 func (ts *TestSubject) DoSomething(arg1 string, arg2 int) {
-	ts.spy.RememberCall(arg1, arg2)
+	ts.spy.WatchCall(arg1, arg2)
 }
 
 func (ts *TestSubject) DoSomethingElse() {
-	ts.spy.RememberCall()
+	ts.spy.WatchCall()
 }
 
 func (ts *TestSubject) AnotherMethod() {
-	ts.spy.RememberCall()
+	ts.spy.WatchCall()
 }
 
 func TestSpy_Happened(t *testing.T) {

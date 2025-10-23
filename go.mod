@@ -1,3 +1,3 @@
-module github.com/lautaromei/happnd
+module awesomeProject
 
 go 1.21

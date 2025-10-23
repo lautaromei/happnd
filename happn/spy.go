@@ -21,7 +21,7 @@ func NewSpy() *Spy {
 	}
 }
 
-func (m *Spy) RememberCall(params ...any) {
+func (m *Spy) WatchCall(params ...any) {
 	pc, _, _, ok := runtime.Caller(1)
 	if !ok {
 		panic("Couldn't get the caller information")
