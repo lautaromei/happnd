@@ -98,6 +98,9 @@ func TestSpy_Happened(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "but it was called 0 times with those arguments") {
 			t.Errorf("Expected error to mention '0 times with those arguments', but got: %v", err)
 		}
+		if err != nil && strings.Contains(err.Error(), "unexpected call") {
+			t.Errorf("Error should not report an 'unexpected call' for a parameter mismatch: %v", err)
+		}
 	})
 
 	t.Run("fails on wrong number of calls", func(t *testing.T) {
@@ -116,6 +119,9 @@ func TestSpy_Happened(t *testing.T) {
 			t.Error("Expected an error, but got nil")
 		} else if !strings.Contains(err.Error(), "expected 'DoSomething' to be called 1 time(s), but it was called 2 time(s)") {
 			t.Errorf("Expected error to mention call count mismatch, but got: %v", err)
+		}
+		if err != nil && strings.Contains(err.Error(), "unexpected call") {
+			t.Errorf("Error should not report an 'unexpected call' for a call count mismatch: %v", err)
 		}
 	})
 

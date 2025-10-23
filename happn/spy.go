@@ -89,6 +89,15 @@ func (m *Spy) verifyExpectations(calls map[string][][]any, assertions []*CalledF
 		if actualCount != assertion.times {
 			allCallsForFunc := calls[assertion.funcName]
 			errs = append(errs, m.buildMismatchedCallError(assertion, actualCount, allCallsForFunc))
+			// If the function was called but with the wrong parameters,
+			// consume those calls to prevent them from being reported as "unexpected".
+			if actualCount == 0 && len(allCallsForFunc) > 0 {
+				delete(calls, assertion.funcName)
+			} else if actualCount > 0 {
+				// Consume the calls that did match to prevent them from being reported as unexpected,
+				// even though the count was wrong.
+				delete(calls, assertion.funcName)
+			}
 		} else if actualCount > 0 {
 			// Consume the verified calls from the copy
 			for i := 0; i < assertion.times; i++ {
