@@ -1,4 +1,4 @@
-package happn
+package main
 
 import (
 	"fmt"

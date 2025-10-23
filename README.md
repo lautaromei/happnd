@@ -16,7 +16,7 @@ In testing, it's crucial to verify that components interact correctly with their
 ```go
 package main
 
-import "github.com/lautaromei/happnd/happn"
+import "github.com/lautaromei/happnd"
 
 type Greeter interface {
 	Greet(name string) string
@@ -45,7 +45,7 @@ package main
 
 import (
 	"testing"
-	"github.com/lautaromei/happn"
+	"github.com/lautaromei/happnd"
 )
 
 func TestGreeterInteraction(t *testing.T) {
