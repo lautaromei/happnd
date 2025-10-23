@@ -6,24 +6,22 @@ import (
 	"runtime"
 )
 
-// Called starts a verification chain for a specific function.
-func Called(function any) *CallAssertion {
+func Called(function any) *CalledFunc {
 	v := reflect.ValueOf(function)
 	if v.Kind() != reflect.Func {
-		return &CallAssertion{
+		return &CalledFunc{
 			err: fmt.Errorf("Called() expects a function, but received a value of type %T", function),
 		}
 	}
 
 	fullName := runtime.FuncForPC(v.Pointer()).Name()
-	return &CallAssertion{
+	return &CalledFunc{
 		times:    1,
 		funcName: cleanFuncName(fullName),
 	}
 }
 
-// CallAssertion allows building assertions about function calls.
-type CallAssertion struct {
+type CalledFunc struct {
 	expectedArgs []any
 
 	funcName string
@@ -31,7 +29,7 @@ type CallAssertion struct {
 	times    int
 }
 
-func (a *CallAssertion) Times(n int) *CallAssertion {
+func (a *CalledFunc) Times(n int) *CalledFunc {
 	if a.err != nil {
 		return a
 	}
@@ -39,11 +37,11 @@ func (a *CallAssertion) Times(n int) *CallAssertion {
 	return a
 }
 
-func (a *CallAssertion) Once() *CallAssertion {
+func (a *CalledFunc) Once() *CalledFunc {
 	return a.Times(1)
 }
 
-func (a *CallAssertion) WithParams(params ...any) *CallAssertion {
+func (a *CalledFunc) WithParams(params ...any) *CalledFunc {
 	if a.err != nil {
 		return a
 	}

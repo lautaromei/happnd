@@ -49,7 +49,7 @@ func (m *Spy) TotalCalls() int {
 	return count
 }
 
-func (m *Spy) Happened(that ...*CallAssertion) (bool, error) {
+func (m *Spy) Happened(that ...*CalledFunc) (bool, error) {
 	m.RLock()
 	defer m.RUnlock()
 
@@ -75,7 +75,7 @@ func (m *Spy) Happened(that ...*CallAssertion) (bool, error) {
 }
 
 // verifyExpectations checks each assertion against the recorded calls, consuming them if they match.
-func (m *Spy) verifyExpectations(calls map[string][][]any, assertions []*CallAssertion) []string {
+func (m *Spy) verifyExpectations(calls map[string][][]any, assertions []*CalledFunc) []string {
 	var errs []string
 	for _, assertion := range assertions {
 		if assertion.err != nil {
@@ -116,7 +116,7 @@ func (m *Spy) checkUnexpectedCalls(calls map[string][][]any) error {
 }
 
 // buildMismatchedCallError creates a detailed error message for a failed assertion.
-func (m *Spy) buildMismatchedCallError(a *CallAssertion, actualCount int, allCallsForFunc [][]any) string {
+func (m *Spy) buildMismatchedCallError(a *CalledFunc, actualCount int, allCallsForFunc [][]any) string {
 	if actualCount == 0 {
 		if len(allCallsForFunc) > 0 {
 			expectedArgsStr := "with any arguments"
@@ -135,7 +135,7 @@ func (m *Spy) buildMismatchedCallError(a *CallAssertion, actualCount int, allCal
 	return fmt.Sprintf("expected '%s' to be called %d time(s), but it was called %d time(s)", a.funcName, a.times, actualCount)
 }
 
-func (m *Spy) filterMatchingCalls(calls map[string][][]any, a *CallAssertion) [][]any {
+func (m *Spy) filterMatchingCalls(calls map[string][][]any, a *CalledFunc) [][]any {
 	recordedCalls, found := calls[a.funcName]
 	if !found {
 		return nil
@@ -154,7 +154,7 @@ func (m *Spy) filterMatchingCalls(calls map[string][][]any, a *CallAssertion) []
 	return matchingCalls
 }
 
-func (m *Spy) consumeCall(calls map[string][][]any, a *CallAssertion) {
+func (m *Spy) consumeCall(calls map[string][][]any, a *CalledFunc) {
 	allCalls := calls[a.funcName]
 	for i, call := range allCalls {
 		if paramsMatch(a.expectedArgs, call) {
