@@ -19,8 +19,15 @@ type CallRecord struct {
 	Params          []any
 }
 
+// failureRecord stores information about a failed assertion.
+type failureRecord struct {
+	failedAssertion *CalledFunc
+	reason          string
+}
+
 type Spy struct {
-	calls []*CallRecord
+	calls       []*CallRecord
+	lastFailure *failureRecord // Stores info about the last failed expectation.
 	sync.RWMutex
 }
 
@@ -61,6 +68,7 @@ func (m *Spy) WatchCall(params ...any) {
 func (m *Spy) Clear() {
 	m.Lock()
 	defer m.Unlock()
+	m.lastFailure = nil
 	m.calls = make([]*CallRecord, 0)
 }
 
@@ -105,7 +113,56 @@ func (m *Spy) DrawGraph() string {
 		}
 	}
 
+	// If an assertion failed, add a detailed failure box to the graph.
+	if m.lastFailure != nil {
+		finalBuilder.WriteString("\n--- Assertion Failure Details ---\n")
+		finalBuilder.WriteString(m.drawFailureDetails())
+	}
+
 	return finalBuilder.String()
+}
+
+// drawFailureDetails generates a text box explaining what was expected vs. what actually happened.
+func (m *Spy) drawFailureDetails() string {
+	var builder strings.Builder
+	failedAssertion := m.lastFailure.failedAssertion
+	reason := m.lastFailure.reason
+
+	// --- Expected Call ---
+	builder.WriteString("Expected call:\n")
+	expectedNodeName := cleanFuncName(failedAssertion.funcName)
+	expectedBoxLines := m.formatNodeAsLines(expectedNodeName, failedAssertion.expectedArgs)
+
+	// Draw the expected box, but "crossed out" to indicate failure.
+	builder.WriteString(strings.ReplaceAll(expectedBoxLines[0], "-", "~"))
+	builder.WriteString("\n")
+	builder.WriteString(fmt.Sprintf("%s  <-- (X) FAILED\n", expectedBoxLines[1]))
+	builder.WriteString(strings.ReplaceAll(expectedBoxLines[2], "-", "~"))
+	builder.WriteString("\n")
+	builder.WriteString(fmt.Sprintf("Reason: %s\n", reason))
+
+	// --- Actual Call (if applicable) ---
+	// Find an actual call with the same method name to show for comparison.
+	if strings.Contains(reason, "but it was called 0 times with those arguments") {
+		var actualCall *CallRecord
+		for _, call := range m.calls {
+			if call.CalleeMethod == expectedNodeName {
+				actualCall = call
+				break
+			}
+		}
+
+		if actualCall != nil {
+			builder.WriteString("\nActual call found:\n")
+			actualNodeName := fmt.Sprintf("%s.%s", actualCall.CalleeComponent, actualCall.CalleeMethod)
+			actualBoxLines := m.formatNodeAsLines(actualNodeName, actualCall.Params)
+			actualBoxLines[1] = fmt.Sprintf("%s  <-- (+) ACTUAL", actualBoxLines[1])
+			builder.WriteString(strings.Join(actualBoxLines, "\n"))
+			builder.WriteString("\n")
+		}
+	}
+
+	return builder.String()
 }
 
 func (m *Spy) buildCallChains() [][]*CallRecord {
@@ -168,12 +225,15 @@ func (m *Spy) chainToString(chain []*CallRecord) string {
 	for i, nodeName := range nodes {
 		boxLines := m.formatNodeAsLines(nodeName, nodeParams[i])
 		top.WriteString(boxLines[0])
-		middle.WriteString(boxLines[1])
+
+		middleLine := boxLines[1]
+		middle.WriteString(middleLine)
+
 		bottom.WriteString(boxLines[2])
 
 		// If it's not the last node, add a connecting arrow.
 		if i < len(nodes)-1 {
-			arrow := " --[1]--> "
+			arrow := " --> "
 			top.WriteString(strings.Repeat(" ", len(arrow)))
 			middle.WriteString(arrow)
 			bottom.WriteString(strings.Repeat(" ", len(arrow)))
@@ -196,7 +256,7 @@ func (m *Spy) formatNodeAsLines(name string, params []any) []string {
 	}
 
 	content := fmt.Sprintf("%s%s", name, paramsStr)
-	width := len(content) + 2
+	width := len(content) + 2 // +2 for padding
 	topLine := "." + strings.Repeat("-", width) + "."
 	middleLine := fmt.Sprintf("| %s |", content)
 	bottomLine := "'" + strings.Repeat("-", width) + "'"
@@ -211,7 +271,7 @@ func (m *Spy) Happened(that ...*CalledFunc) (bool, error) {
 	// Group recorded calls by function name for efficient lookup.
 	callsByFunc := make(map[string][][]any)
 	for _, call := range m.calls {
-		funcName := cleanFuncName(call.CalleeMethod)
+		funcName := call.CalleeMethod
 		callsByFunc[funcName] = append(callsByFunc[funcName], call.Params)
 	}
 
@@ -223,22 +283,32 @@ func (m *Spy) Happened(that ...*CalledFunc) (bool, error) {
 		copiedCalls[funcName] = callsCopy
 	}
 
-	errs := m.verifyExpectations(copiedCalls, that)
+	errs := m.verifyExpectations(copiedCalls, callsByFunc, that)
 
 	if unexpectedErr := m.checkUnexpectedCalls(copiedCalls); unexpectedErr != nil {
 		errs = append(errs, unexpectedErr.Error())
 	}
 
 	if len(errs) > 0 {
-		return false, fmt.Errorf("found %d error(s) during expectation assertion:\n- %s", len(errs), strings.Join(errs, "\n- "))
+		// On failure, generate the graph and include it in the error.
+		errorReport := fmt.Sprintf("found %d error(s) during expectation assertion:\n- %s\n\n", len(errs), strings.Join(errs, "\n- "))
+		graph := m.DrawGraph()
+		return false, fmt.Errorf("%s%s", errorReport, graph)
 	}
 
 	return true, nil
 }
 
 // verifyExpectations checks each assertion against the recorded calls, consuming them if they match.
-func (m *Spy) verifyExpectations(calls map[string][][]any, assertions []*CalledFunc) []string {
+func (m *Spy) verifyExpectations(calls, originalCalls map[string][][]any, assertions []*CalledFunc) []string {
 	var errs []string
+	firstFailureSet := false
+
+	setFailure := func(assertion *CalledFunc, reason string) {
+		m.lastFailure = &failureRecord{failedAssertion: assertion, reason: reason}
+		firstFailureSet = true
+	}
+
 	for _, assertion := range assertions {
 		if assertion.err != nil {
 			errs = append(errs, assertion.err.Error())
@@ -249,8 +319,12 @@ func (m *Spy) verifyExpectations(calls map[string][][]any, assertions []*CalledF
 		actualCount := len(matchingCalls)
 
 		if actualCount != assertion.times {
-			allCallsForFunc := calls[assertion.funcName]
-			errs = append(errs, m.buildMismatchedCallError(assertion, actualCount, allCallsForFunc))
+			allCallsForFunc := originalCalls[assertion.funcName] // Use original calls for error reporting
+			errMsg := m.buildMismatchedCallError(assertion, actualCount, allCallsForFunc)
+			errs = append(errs, errMsg)
+			if !firstFailureSet {
+				setFailure(assertion, errMsg)
+			}
 			// If the function was called but with the wrong parameters,
 			// consume those calls to prevent them from being reported as "unexpected".
 			if actualCount == 0 && len(allCallsForFunc) > 0 {
@@ -299,7 +373,7 @@ func (m *Spy) buildMismatchedCallError(a *CalledFunc, actualCount int, allCallsF
 				fmt.Fprintf(&receivedCallsStr, "\n    - Call %d: %v", i+1, call)
 			}
 			return fmt.Sprintf("expected '%s' to be called %d time(s) %s, but it was called 0 times with those arguments. %d call(s) were recorded with the following arguments:%s",
-				a.funcName, a.times, expectedArgsStr, len(allCallsForFunc), receivedCallsStr.String())
+				cleanFuncName(a.funcName), a.times, expectedArgsStr, len(allCallsForFunc), receivedCallsStr.String())
 		}
 		return fmt.Sprintf("expected '%s' to be called %d time(s), but it was not called.", a.funcName, a.times)
 	}
@@ -308,7 +382,7 @@ func (m *Spy) buildMismatchedCallError(a *CalledFunc, actualCount int, allCallsF
 
 func (m *Spy) filterMatchingCalls(calls map[string][][]any, a *CalledFunc) [][]any {
 	recordedCalls, found := calls[a.funcName]
-	if !found {
+	if !found || len(recordedCalls) == 0 {
 		return nil
 	}
 
@@ -372,7 +446,7 @@ func splitFullFuncName(fullName string) (component, method string) {
 	methodName := parts[len(parts)-1]
 	componentPath := strings.Join(parts[:len(parts)-1], ".")
 	componentParts := strings.Split(componentPath, "/")
-	return strings.TrimPrefix(componentParts[len(componentParts)-1], "("), methodName
+	return strings.TrimPrefix(strings.TrimPrefix(componentParts[len(componentParts)-1], "("), "*"), methodName
 }
 
 // --- Matchers ---
