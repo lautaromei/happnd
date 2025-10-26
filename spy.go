@@ -110,34 +110,36 @@ func (m *Spy) DrawGraph() string {
 
 func (m *Spy) buildCallChains() [][]*CallRecord {
 	var chains [][]*CallRecord
-	callsCopy := make([]*CallRecord, len(m.calls))
-	copy(callsCopy, m.calls)
-
-	for len(callsCopy) > 0 {
-		// Start a new chain with the first available call
-		chain := []*CallRecord{callsCopy[0]}
-		callsCopy = callsCopy[1:]
-
-		// Continue building the chain
-		for {
-			lastCall := chain[len(chain)-1]
-			foundNext := false
-			for i, nextCall := range callsCopy {
-				// Check if the next call was made by the last call in the chain
-				if nextCall.CallerComponent == lastCall.CalleeComponent && nextCall.CallerMethod == lastCall.CalleeMethod {
-					chain = append(chain, nextCall)
-					// Remove the call from the list
-					callsCopy = append(callsCopy[:i], callsCopy[i+1:]...)
-					foundNext = true
-					break // Continue with the new last call
-				}
-			}
-			if !foundNext {
-				break // End of this chain
-			}
-		}
-		chains = append(chains, chain)
+	if len(m.calls) == 0 {
+		return chains
 	}
+
+	// Group calls by their direct caller to handle sequences like A->B, A->C
+	callsByCaller := make(map[string][]*CallRecord)
+	for _, call := range m.calls {
+		callerID := fmt.Sprintf("%s.%s", call.CallerComponent, call.CallerMethod)
+		callsByCaller[callerID] = append(callsByCaller[callerID], call)
+	}
+
+	// Find the root calls (those initiated by the test itself or an un-spied function)
+	calleeSet := make(map[string]bool)
+	for _, call := range m.calls {
+		calleeID := fmt.Sprintf("%s.%s", call.CalleeComponent, call.CalleeMethod)
+		calleeSet[calleeID] = true
+	}
+
+	for callerID, callGroup := range callsByCaller {
+		if _, ok := calleeSet[callerID]; !ok {
+			// This caller was never a callee, so it's a root of a chain.
+			chains = append(chains, callGroup)
+		}
+	}
+
+	// Fallback for cases where the root is not easily identifiable (e.g., everything is spied)
+	if len(chains) == 0 && len(m.calls) > 0 {
+		return [][]*CallRecord{m.calls}
+	}
+
 	return chains
 }
 
