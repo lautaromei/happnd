@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"path"
 	"reflect"
 	"runtime"
 	"strings"
@@ -16,6 +17,9 @@ type CallRecord struct {
 	CallerMethod    string
 	CalleeComponent string
 	CalleeMethod    string
+	CalleeFile      string
+	CalleeFileName  string // Just the filename
+	CalleeLine      int
 	Params          []any
 }
 
@@ -50,6 +54,7 @@ func (m *Spy) WatchCall(params ...any) {
 	calleeFrame, _ := runtime.CallersFrames(pcs[0:1]).Next()
 	calleeComponent, calleeMethod := splitFullFuncName(calleeFrame.Function)
 
+	// Get just the filename from the full path
 	callerComponent, callerMethod := "Test", "Unknown"
 	if n > 1 {
 		callerFrame, _ := runtime.CallersFrames(pcs[1:2]).Next()
@@ -63,6 +68,9 @@ func (m *Spy) WatchCall(params ...any) {
 		CallerMethod:    callerMethod,
 		CalleeComponent: calleeComponent,
 		CalleeMethod:    calleeMethod,
+		CalleeFile:      calleeFrame.File,
+		CalleeFileName:  path.Base(calleeFrame.File),
+		CalleeLine:      calleeFrame.Line,
 		Params:          params,
 	})
 }
@@ -132,12 +140,12 @@ func (m *Spy) verifyExpectations(calls map[string][]*CallRecord, assertions []*C
 			continue
 		}
 
-		matchingCalls := m.filterMatchingCalls(calls, assertion)
+		allCallsForFunc := calls[assertion.funcName]
+		matchingCalls := m.filterMatchingCalls(allCallsForFunc, assertion)
 		actualCount := len(matchingCalls)
 
 		if actualCount != assertion.times {
 			// For error reporting, get all calls for this function name from the original map.
-			allCallsForFunc := calls[assertion.funcName]
 			errMsg := m.buildMismatchedCallError(assertion, actualCount, allCallsForFunc)
 			errs = append(errs, errMsg)
 			m.failures = append(m.failures, &failureRecord{failedAssertion: assertion, reason: errMsg, actualCount: actualCount})
@@ -150,11 +158,9 @@ func (m *Spy) verifyExpectations(calls map[string][]*CallRecord, assertions []*C
 				// even though the count was wrong.
 				delete(calls, assertion.funcName)
 			}
-		} else if actualCount > 0 {
-			// Consume the verified calls from the copy
-			for i := 0; i < assertion.times; i++ {
-				m.consumeCall(calls, assertion)
-			}
+		} else { // actualCount == assertion.times
+			// Consume the verified calls from the main map
+			m.consumeMatchingCalls(calls, assertion.funcName, matchingCalls)
 		}
 	}
 	return errs
@@ -169,40 +175,50 @@ func (m *Spy) checkUnexpectedCalls(calls map[string][]*CallRecord) error {
 		if len(remainingCalls) > 0 {
 			for _, call := range remainingCalls {
 				unexpectedCount++
+				callLocation := fmt.Sprintf("%s:%d", call.CalleeFileName, call.CalleeLine)
 				nodeName := fmt.Sprintf("%s.%s", call.CalleeComponent, call.CalleeMethod)
-				boxLines := m.formatNodeAsLines(nodeName, call.Params, true, 1)
-				// Make the box bold
-				boldBox := fmt.Sprintf("%s%s%s\n%s%s%s%s\n%s%s%s", bold, red, boxLines[0], bold, red, boxLines[1], reset, bold, red, boxLines[2])
-				unexpectedDetails = append(unexpectedDetails, boldBox)
+				callStr := fmt.Sprintf("%s: %s%sunexpected call: %s%s%s", callLocation, bold, red, nodeName, formatArgs(call.Params), reset)
+				unexpectedDetails = append(unexpectedDetails, callStr)
 				m.unexpectedCalls = append(m.unexpectedCalls, call)
 			}
 		}
 	}
 	if unexpectedCount > 0 {
-		return fmt.Errorf("found %d unexpected call(s):\n%s", unexpectedCount, strings.Join(unexpectedDetails, "\n\n"))
+		return fmt.Errorf("found %d unexpected call(s):\n- %s", unexpectedCount, strings.Join(unexpectedDetails, "\n- "))
 	}
 	return nil
 }
 
 // buildMismatchedCallError creates a detailed error message for a failed assertion.
-func (m *Spy) buildMismatchedCallError(a *CalledFunc, actualCount int, allCallsForFunc []*CallRecord) string {
+func (m *Spy) buildMismatchedCallError(a *CalledFunc, actualCount int, allRecordedCallsForFunc []*CallRecord) string {
 	cleanName := cleanFuncName(a.funcName)
 	if actualCount == 0 {
-		if len(allCallsForFunc) > 0 {
-			// If a specific caller was expected, the error should be about the caller mismatch.
+		if len(allRecordedCallsForFunc) > 0 {
+			// If a specific caller was expected, the error is about the caller mismatch.
 			if a.callerComponent != "" {
 				callersFound := make(map[string]bool)
-				for _, call := range allCallsForFunc {
-					callersFound[call.CallerComponent] = true
+				var firstMismatchLocation string
+				for _, call := range allRecordedCallsForFunc {
+					// Only consider calls that would have otherwise matched on parameters
+					if paramsMatch(a.expectedArgs, call.Params) {
+						callersFound[call.CallerComponent] = true
+					}
 				}
-				var foundCallerNames []string
-				for name := range callersFound {
-					foundCallerNames = append(foundCallerNames, fmt.Sprintf("'%s'", name))
+				if len(callersFound) > 0 {
+					// Find the location of the first call that caused this mismatch
+					for _, call := range allRecordedCallsForFunc {
+						if paramsMatch(a.expectedArgs, call.Params) {
+							firstMismatchLocation = fmt.Sprintf("%s:%d: ", call.CalleeFileName, call.CalleeLine)
+							break
+						}
+					}
+					var foundCallerNames []string
+					for name := range callersFound {
+						foundCallerNames = append(foundCallerNames, fmt.Sprintf("'%s'", name))
+					}
+					return fmt.Sprintf("%sexpected '%s' to be called by '%s', but it was called by %s instead.", firstMismatchLocation, cleanName, a.callerComponent, strings.Join(foundCallerNames, ", "))
 				}
-				return fmt.Sprintf("expected '%s' to be called by '%s', but it was called by %s instead.",
-					cleanName, a.callerComponent, strings.Join(foundCallerNames, ", "))
 			}
-
 			// Otherwise, the error is about mismatched arguments.
 			expectedArgsStr := "with any arguments"
 			if len(a.expectedArgs) > 0 {
@@ -210,24 +226,26 @@ func (m *Spy) buildMismatchedCallError(a *CalledFunc, actualCount int, allCallsF
 			}
 
 			var receivedCallsStr strings.Builder
-			for i, call := range allCallsForFunc {
+			for i, call := range allRecordedCallsForFunc {
 				if len(call.Params) == 0 {
 					fmt.Fprintf(&receivedCallsStr, "\n    - Call %d: (no arguments)", i+1)
 				} else {
 					fmt.Fprintf(&receivedCallsStr, "\n    - Call %d: %v", i+1, call.Params)
 				}
 			}
-			return fmt.Sprintf("expected '%s' to be called %d time(s) %s, but it was called 0 times with those arguments. %d call(s) were recorded with different arguments:%s",
-				cleanName, a.times, expectedArgsStr, len(allCallsForFunc), receivedCallsStr.String())
+			// Prepend the location of the first recorded call for this function.
+			location := fmt.Sprintf("%s:%d: ", allRecordedCallsForFunc[0].CalleeFileName, allRecordedCallsForFunc[0].CalleeLine)
+			return fmt.Sprintf("%sexpected '%s' to be called %d time(s) %s, but it was called 0 times with those arguments. %d call(s) were recorded with different arguments:%s", location, cleanName, a.times, expectedArgsStr, len(allRecordedCallsForFunc), receivedCallsStr.String())
 		}
 		return fmt.Sprintf("expected '%s' to be called %d time(s), but it was not called.", cleanName, a.times)
 	}
-	return fmt.Sprintf("expected '%s' to be called %d time(s), but it was called %d time(s)", cleanName, a.times, actualCount)
+	// For call count mismatches, point to the first call.
+	location := fmt.Sprintf("%s:%d: ", allRecordedCallsForFunc[0].CalleeFileName, allRecordedCallsForFunc[0].CalleeLine)
+	return fmt.Sprintf("%sexpected '%s' to be called %d time(s), but it was called %d time(s)", location, cleanName, a.times, actualCount)
 }
 
-func (m *Spy) filterMatchingCalls(calls map[string][]*CallRecord, a *CalledFunc) []*CallRecord {
-	recordedCalls, found := calls[a.funcName]
-	if !found || len(recordedCalls) == 0 {
+func (m *Spy) filterMatchingCalls(recordedCalls []*CallRecord, a *CalledFunc) []*CallRecord {
+	if len(recordedCalls) == 0 {
 		return nil
 	}
 
@@ -264,15 +282,28 @@ func filterByCaller(calls []*CallRecord, callerComponent string) []*CallRecord {
 	return filtered
 }
 
-func (m *Spy) consumeCall(calls map[string][]*CallRecord, a *CalledFunc) {
-	allCalls := calls[a.funcName]
-	for i, call := range allCalls {
-		if paramsMatch(a.expectedArgs, call.Params) {
-			// Remove the element at index i
-			calls[a.funcName] = append(allCalls[:i], allCalls[i+1:]...)
-			return
+func (m *Spy) consumeMatchingCalls(allCalls map[string][]*CallRecord, funcName string, callsToConsume []*CallRecord) {
+	if len(callsToConsume) == 0 {
+		return
+	}
+
+	// Create a set of pointers for quick lookup of calls to consume.
+	consumeSet := make(map[*CallRecord]bool, len(callsToConsume))
+	for _, call := range callsToConsume {
+		consumeSet[call] = true
+	}
+
+	// Get the original slice of calls for this function.
+	originalCalls := allCalls[funcName]
+	// Create a new slice to hold the calls that are not consumed.
+	var remainingCalls []*CallRecord
+	for _, call := range originalCalls {
+		if !consumeSet[call] {
+			remainingCalls = append(remainingCalls, call)
 		}
 	}
+
+	allCalls[funcName] = remainingCalls
 }
 
 func paramsMatch(expected, actual []any) bool {
