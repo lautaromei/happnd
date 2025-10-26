@@ -70,46 +70,136 @@ func (m *Spy) TotalCalls() int {
 	return len(m.calls)
 }
 
-// DrawGraph generates a string representation of the call graph.
+// DrawGraph generates a sequential, ASCII-based representation of the call graph.
 func (m *Spy) DrawGraph() string {
 	m.RLock()
 	defer m.RUnlock()
 
 	if len(m.calls) == 0 {
-		return "No calls recorded."
+		return "Call Graph: No calls recorded.\n"
 	}
 
-	var sb strings.Builder
-	sb.WriteString("Call Graph:\n")
+	// Build chains of calls
+	chains := m.buildCallChains()
 
-	// Use a map to count identical calls for a cleaner output
-	callCounts := make(map[string]int)
-	uniqueCalls := make([]string, 0)
-
-	for _, call := range m.calls {
-		// Normalize test function names for consistent output
-		callerMethod := call.CallerMethod
-		if strings.HasPrefix(callerMethod, "Test") {
-			callerMethod = "Test"
+	// Count identical chains to keep the output clean
+	chainCounts := make(map[string]int)
+	uniqueChainKeys := make([]string, 0)
+	for _, chain := range chains {
+		key := m.chainToString(chain)
+		if _, exists := chainCounts[key]; !exists {
+			uniqueChainKeys = append(uniqueChainKeys, key)
 		}
-
-		graphEntry := fmt.Sprintf("%s.%s -> %s.%s", call.CallerComponent, callerMethod, call.CalleeComponent, call.CalleeMethod)
-		if callCounts[graphEntry] == 0 {
-			uniqueCalls = append(uniqueCalls, graphEntry)
-		}
-		callCounts[graphEntry]++
+		chainCounts[key]++
 	}
 
-	for _, entry := range uniqueCalls {
-		count := callCounts[entry]
+	var finalBuilder strings.Builder
+	finalBuilder.WriteString("Call Graph:\n\n")
+
+	for _, key := range uniqueChainKeys {
+		count := chainCounts[key]
 		if count > 1 {
-			sb.WriteString(fmt.Sprintf("  %s (%d times)\n", entry, count))
+			finalBuilder.WriteString(fmt.Sprintf("%s\n(repeated %d times)\n\n", key, count))
 		} else {
-			sb.WriteString(fmt.Sprintf("  %s\n", entry))
+			finalBuilder.WriteString(fmt.Sprintf("%s\n\n", key))
 		}
 	}
 
-	return sb.String()
+	return finalBuilder.String()
+}
+
+func (m *Spy) buildCallChains() [][]*CallRecord {
+	var chains [][]*CallRecord
+	callsCopy := make([]*CallRecord, len(m.calls))
+	copy(callsCopy, m.calls)
+
+	for len(callsCopy) > 0 {
+		// Start a new chain with the first available call
+		chain := []*CallRecord{callsCopy[0]}
+		callsCopy = callsCopy[1:]
+
+		// Continue building the chain
+		for {
+			lastCall := chain[len(chain)-1]
+			foundNext := false
+			for i, nextCall := range callsCopy {
+				// Check if the next call was made by the last call in the chain
+				if nextCall.CallerComponent == lastCall.CalleeComponent && nextCall.CallerMethod == lastCall.CalleeMethod {
+					chain = append(chain, nextCall)
+					// Remove the call from the list
+					callsCopy = append(callsCopy[:i], callsCopy[i+1:]...)
+					foundNext = true
+					break // Continue with the new last call
+				}
+			}
+			if !foundNext {
+				break // End of this chain
+			}
+		}
+		chains = append(chains, chain)
+	}
+	return chains
+}
+
+func (m *Spy) chainToString(chain []*CallRecord) string {
+	if len(chain) == 0 {
+		return ""
+	}
+
+	var nodes []string
+	var nodeParams [][]any
+
+	// The first node is the caller of the first call in the chain.
+	firstCall := chain[0]
+	callerName := fmt.Sprintf("%s.%s", firstCall.CallerComponent, firstCall.CallerMethod)
+	nodes = append(nodes, callerName)
+	nodeParams = append(nodeParams, nil) // The initial caller has no recorded params.
+
+	// Then, add all the subsequent callees.
+	for _, call := range chain {
+		calleeName := fmt.Sprintf("%s.%s", call.CalleeComponent, call.CalleeMethod)
+		nodes = append(nodes, calleeName)
+		nodeParams = append(nodeParams, call.Params)
+	}
+
+	var top, middle, bottom strings.Builder
+	for i, nodeName := range nodes {
+		boxLines := m.formatNodeAsLines(nodeName, nodeParams[i])
+		top.WriteString(boxLines[0])
+		middle.WriteString(boxLines[1])
+		bottom.WriteString(boxLines[2])
+
+		// If it's not the last node, add a connecting arrow.
+		if i < len(nodes)-1 {
+			arrow := " --[1]--> "
+			top.WriteString(strings.Repeat(" ", len(arrow)))
+			middle.WriteString(arrow)
+			bottom.WriteString(strings.Repeat(" ", len(arrow)))
+		}
+	}
+
+	return fmt.Sprintf("%s\n%s\n%s", top.String(), middle.String(), bottom.String())
+}
+
+func (m *Spy) formatNodeAsLines(name string, params []any) []string {
+	var paramsStr string
+	if params != nil {
+		var paramParts []string
+		for _, p := range params {
+			paramParts = append(paramParts, fmt.Sprintf("%v", p))
+		}
+		if len(paramParts) > 0 {
+			paramsStr = fmt.Sprintf("(%s)", strings.Join(paramParts, ", "))
+		}
+	}
+
+	content := fmt.Sprintf("%s%s", name, paramsStr)
+	width := len(content) + 2
+	topLine := "." + strings.Repeat("-", width) + "."
+	middleLine := fmt.Sprintf("| %s |", content)
+	bottomLine := "'" + strings.Repeat("-", width) + "'"
+
+	return []string{topLine, middleLine, bottomLine}
 }
 
 func (m *Spy) Happened(that ...*CalledFunc) (bool, error) {
