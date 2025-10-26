@@ -55,11 +55,16 @@ func (m *Spy) WatchCall(params ...any) {
 	calleeFrame, _ := runtime.CallersFrames(pcs[0:1]).Next()
 	calleeComponent, calleeMethod := splitFullFuncName(calleeFrame.Function)
 
-	// Get just the filename from the full path
-	callerComponent, callerMethod := "Test", "Unknown"
+	var callerComponent, callerMethod string
 	if n > 1 {
 		callerFrame, _ := runtime.CallersFrames(pcs[1:2]).Next()
 		callerComponent, callerMethod = splitFullFuncName(callerFrame.Function)
+	} else {
+		callerComponent, callerMethod = "Unknown", "Unknown"
+	}
+
+	if strings.HasPrefix(callerMethod, "Test") {
+		// This is the root call from a test. The component is the test package itself.
 	}
 
 	m.Lock()
