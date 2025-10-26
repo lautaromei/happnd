@@ -10,6 +10,13 @@ import (
 
 const Anything = "*"
 
+const (
+	// ANSI escape codes for styling console output.
+	bold  = "\033[1m"
+	red   = "\033[31m"
+	reset = "\033[0m"
+)
+
 // CallRecord stores detailed information about a single function call.
 type CallRecord struct {
 	CallerComponent string
@@ -29,6 +36,7 @@ type Spy struct {
 	calls       []*CallRecord
 	lastFailure *failureRecord // Stores info about the last failed expectation.
 	sync.RWMutex
+	unexpectedCalls []*CallRecord // Temporarily stores unexpected calls for graph drawing.
 }
 
 func NewSpy() *Spy {
@@ -70,6 +78,7 @@ func (m *Spy) Clear() {
 	defer m.Unlock()
 	m.lastFailure = nil
 	m.calls = make([]*CallRecord, 0)
+	m.unexpectedCalls = nil
 }
 
 func (m *Spy) TotalCalls() int {
@@ -90,11 +99,20 @@ func (m *Spy) DrawGraph() string {
 	// Build chains of calls
 	chains := m.buildCallChains()
 
+	// Create a set of unexpected calls for quick lookup.
+	// These are populated during the Happened() check.
+	unexpectedSet := make(map[*CallRecord]bool)
+	if m.unexpectedCalls != nil {
+		for _, uc := range m.unexpectedCalls {
+			unexpectedSet[uc] = true
+		}
+	}
+
 	// Count identical chains to keep the output clean
 	chainCounts := make(map[string]int)
 	uniqueChainKeys := make([]string, 0)
 	for _, chain := range chains {
-		key := m.chainToString(chain)
+		key := m.chainToString(chain, unexpectedSet)
 		if _, exists := chainCounts[key]; !exists {
 			uniqueChainKeys = append(uniqueChainKeys, key)
 		}
@@ -111,12 +129,6 @@ func (m *Spy) DrawGraph() string {
 		} else {
 			finalBuilder.WriteString(fmt.Sprintf("%s\n\n", key))
 		}
-	}
-
-	// If an assertion failed, add a detailed failure box to the graph.
-	if m.lastFailure != nil {
-		finalBuilder.WriteString("\n--- Assertion Failure Details ---\n")
-		finalBuilder.WriteString(m.drawFailureDetails())
 	}
 
 	return finalBuilder.String()
@@ -136,7 +148,7 @@ func (m *Spy) drawFailureDetails() string {
 	// Draw the expected box, but "crossed out" to indicate failure.
 	builder.WriteString(strings.ReplaceAll(expectedBoxLines[0], "-", "~"))
 	builder.WriteString("\n")
-	builder.WriteString(fmt.Sprintf("%s  <-- (X) FAILED\n", expectedBoxLines[1]))
+	builder.WriteString(fmt.Sprintf("%s(X) \n", expectedBoxLines[1]))
 	builder.WriteString(strings.ReplaceAll(expectedBoxLines[2], "-", "~"))
 	builder.WriteString("\n")
 	builder.WriteString(fmt.Sprintf("Reason: %s\n", reason))
@@ -166,47 +178,59 @@ func (m *Spy) drawFailureDetails() string {
 }
 
 func (m *Spy) buildCallChains() [][]*CallRecord {
-	var chains [][]*CallRecord
-	if len(m.calls) == 0 {
-		return chains
-	}
+	chains := [][]*CallRecord{}
+	visited := make(map[*CallRecord]bool)
 
-	// Group calls by their direct caller to handle sequences like A->B, A->C
-	callsByCaller := make(map[string][]*CallRecord)
+	// Identify root calls (calls made from a test function)
+	var rootCalls []*CallRecord
 	for _, call := range m.calls {
-		callerID := fmt.Sprintf("%s.%s", call.CallerComponent, call.CallerMethod)
-		callsByCaller[callerID] = append(callsByCaller[callerID], call)
-	}
-
-	// Find the root calls (those initiated by the test itself or an un-spied function)
-	calleeSet := make(map[string]bool)
-	for _, call := range m.calls {
-		calleeID := fmt.Sprintf("%s.%s", call.CalleeComponent, call.CalleeMethod)
-		calleeSet[calleeID] = true
-	}
-
-	for callerID, callGroup := range callsByCaller {
-		if _, ok := calleeSet[callerID]; !ok {
-			// This caller was never a callee, so it's a root of a chain.
-			chains = append(chains, callGroup)
+		if strings.HasPrefix(call.CallerMethod, "Test") {
+			rootCalls = append(rootCalls, call)
 		}
 	}
 
-	// Fallback for cases where the root is not easily identifiable (e.g., everything is spied)
-	if len(chains) == 0 && len(m.calls) > 0 {
-		return [][]*CallRecord{m.calls}
+	// If no direct test calls, treat all calls as potential roots
+	if len(rootCalls) == 0 {
+		rootCalls = m.calls
 	}
 
+	for _, rootCall := range rootCalls {
+		if visited[rootCall] {
+			continue
+		}
+
+		chain := []*CallRecord{rootCall}
+		visited[rootCall] = true
+		current := rootCall
+
+		// Find the next call in the sequence
+		for i := 0; i < len(m.calls); i++ {
+			nextCall := m.calls[i]
+			if !visited[nextCall] && nextCall.CallerComponent == current.CalleeComponent && nextCall.CallerMethod == current.CalleeMethod {
+				chain = append(chain, nextCall)
+				visited[nextCall] = true
+				current = nextCall
+				i = -1 // Restart search for the next link
+			}
+		}
+		chains = append(chains, chain)
+	}
 	return chains
 }
 
-func (m *Spy) chainToString(chain []*CallRecord) string {
+func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]bool) string {
 	if len(chain) == 0 {
 		return ""
 	}
 
 	var nodes []string
 	var nodeParams [][]any
+
+	// Check if there's a failure to annotate in the graph
+	var failureAnnotation *failureRecord
+	if m.lastFailure != nil {
+		failureAnnotation = m.lastFailure
+	}
 
 	// The first node is the caller of the first call in the chain.
 	firstCall := chain[0]
@@ -216,47 +240,108 @@ func (m *Spy) chainToString(chain []*CallRecord) string {
 
 	// Then, add all the subsequent callees.
 	for _, call := range chain {
+		isUnexpected := unexpectedSet[call]
 		calleeName := fmt.Sprintf("%s.%s", call.CalleeComponent, call.CalleeMethod)
 		nodes = append(nodes, calleeName)
 		nodeParams = append(nodeParams, call.Params)
-	}
 
-	var top, middle, bottom strings.Builder
-	for i, nodeName := range nodes {
-		boxLines := m.formatNodeAsLines(nodeName, nodeParams[i])
-		top.WriteString(boxLines[0])
-
-		middleLine := boxLines[1]
-		middle.WriteString(middleLine)
-
-		bottom.WriteString(boxLines[2])
-
-		// If it's not the last node, add a connecting arrow.
-		if i < len(nodes)-1 {
-			arrow := " --> "
-			top.WriteString(strings.Repeat(" ", len(arrow)))
-			middle.WriteString(arrow)
-			bottom.WriteString(strings.Repeat(" ", len(arrow)))
+		// If the call is unexpected, mark it in the graph.
+		if isUnexpected {
+			// We'll add the bold formatting when building the lines.
+			// For now, just add a marker to the node name.
+			nodes[len(nodes)-1] = fmt.Sprintf("%s%s%s%s", bold, red, nodes[len(nodes)-1], reset)
 		}
 	}
 
-	return fmt.Sprintf("%s\n%s\n%s", top.String(), middle.String(), bottom.String())
+	var lines [][]string
+	var nodeWidths []int
+
+	for i, nodeName := range nodes {
+		params := nodeParams[i]
+		boxLines := m.formatNodeAsLines(nodeName, params)
+		lines = append(lines, boxLines)
+		nodeWidths = append(nodeWidths, getVisibleLength(boxLines[1]))
+
+		// If this node is the one that failed the assertion, add failure details.
+		if failureAnnotation != nil && strings.Contains(nodeName, failureAnnotation.failedAssertion.funcName) {
+			expectedArgsStr := fmt.Sprintf("%v", failureAnnotation.failedAssertion.expectedArgs)
+			actualArgsStr := fmt.Sprintf("%v", params)
+
+			// Add the failure annotation as a new line below the box.
+			failureText := fmt.Sprintf("it expected %s, got %s", expectedArgsStr, actualArgsStr)
+
+			// Calculate padding to center the annotation under its box.
+			boxWidth := nodeWidths[i]
+			annotationWidth := len(failureText)
+			padding := (boxWidth - annotationWidth) / 2
+			if padding < 0 {
+				padding = 0
+			}
+			paddingStr := strings.Repeat(" ", padding)
+			lines[i] = append(lines[i], fmt.Sprintf("%s%s%s%s%s", paddingStr, bold, red, failureText, reset))
+		}
+	}
+
+	// Assemble the final graph string, line by line.
+	var result strings.Builder
+	maxLines := 0
+	for _, lineSet := range lines {
+		if len(lineSet) > maxLines {
+			maxLines = len(lineSet)
+		}
+	}
+
+	for lineIdx := 0; lineIdx < maxLines; lineIdx++ {
+		for nodeIdx, lineSet := range lines {
+			if lineIdx < len(lineSet) {
+				result.WriteString(lineSet[lineIdx])
+			} else {
+				result.WriteString(strings.Repeat(" ", nodeWidths[nodeIdx]))
+			}
+
+			if nodeIdx < len(lines)-1 {
+				arrow := " --> "
+				if lineIdx == 1 { // Middle line of the box
+					result.WriteString(arrow)
+				} else {
+					result.WriteString(strings.Repeat(" ", len(arrow)))
+				}
+			}
+		}
+		if lineIdx < maxLines-1 {
+			result.WriteString("\n")
+		}
+	}
+
+	return result.String()
 }
 
 func (m *Spy) formatNodeAsLines(name string, params []any) []string {
 	var paramsStr string
 	if params != nil {
 		var paramParts []string
+		isBold := strings.HasPrefix(name, bold)
+
 		for _, p := range params {
-			paramParts = append(paramParts, fmt.Sprintf("%v", p))
+			// If the node is bold, make the params bold too.
+			if isBold {
+				paramParts = append(paramParts, fmt.Sprintf("%s%s%v%s", bold, red, p, reset))
+			} else {
+				paramParts = append(paramParts, fmt.Sprintf("%v", p))
+			}
 		}
 		if len(paramParts) > 0 {
-			paramsStr = fmt.Sprintf("(%s)", strings.Join(paramParts, ", "))
+			// The comma and parentheses should also be bold if the content is.
+			if isBold {
+				paramsStr = fmt.Sprintf("%s%s(%s)%s", bold, red, strings.Join(paramParts, ", "), reset)
+			} else {
+				paramsStr = fmt.Sprintf("(%s)", strings.Join(paramParts, ", "))
+			}
 		}
 	}
 
-	content := fmt.Sprintf("%s%s", name, paramsStr)
-	width := len(content) + 2 // +2 for padding
+	content := fmt.Sprintf("%s%s", name, paramsStr) // name might already be bold
+	width := getVisibleLength(content) + 2          // +2 for padding
 	topLine := "." + strings.Repeat("-", width) + "."
 	middleLine := fmt.Sprintf("| %s |", content)
 	bottomLine := "'" + strings.Repeat("-", width) + "'"
@@ -264,33 +349,48 @@ func (m *Spy) formatNodeAsLines(name string, params []any) []string {
 	return []string{topLine, middleLine, bottomLine}
 }
 
+// getVisibleLength calculates the visible length of a string by stripping ANSI codes.
+func getVisibleLength(s string) int {
+	// A simple way to strip ANSI codes is to remove them with a regex,
+	// but for this specific case, we can just replace the known codes.
+	s = strings.ReplaceAll(s, bold, "")
+	s = strings.ReplaceAll(s, red, "")
+	s = strings.ReplaceAll(s, reset, "")
+	return len(s)
+}
+
 func (m *Spy) Happened(that ...*CalledFunc) (bool, error) {
 	m.RLock()
 	defer m.RUnlock()
+	// Clear any previous unexpected call records before a new check.
+	m.unexpectedCalls = nil
 
 	// Group recorded calls by function name for efficient lookup.
-	callsByFunc := make(map[string][][]any)
+	callsByFunc := make(map[string][]*CallRecord)
 	for _, call := range m.calls {
-		funcName := call.CalleeMethod
-		callsByFunc[funcName] = append(callsByFunc[funcName], call.Params)
+		callsByFunc[call.CalleeMethod] = append(callsByFunc[call.CalleeMethod], call)
 	}
 
 	// Create a mutable copy of the grouped calls to work with.
-	copiedCalls := make(map[string][][]any, len(callsByFunc))
+	copiedCalls := make(map[string][]*CallRecord, len(callsByFunc))
 	for funcName, calls := range callsByFunc {
-		callsCopy := make([][]any, len(calls))
+		callsCopy := make([]*CallRecord, len(calls))
 		copy(callsCopy, calls)
 		copiedCalls[funcName] = callsCopy
 	}
 
-	errs := m.verifyExpectations(copiedCalls, callsByFunc, that)
+	errs := m.verifyExpectations(copiedCalls, that)
 
+	// Check for unexpected calls *after* verifying expectations.
+	// The `verifyExpectations` function sets `lastFailure` if an assertion fails.
 	if unexpectedErr := m.checkUnexpectedCalls(copiedCalls); unexpectedErr != nil {
 		errs = append(errs, unexpectedErr.Error())
 	}
 
 	if len(errs) > 0 {
 		// On failure, generate the graph and include it in the error.
+		// The graph drawing logic will automatically include failure annotations if `m.lastFailure` was set.
+
 		errorReport := fmt.Sprintf("found %d error(s) during expectation assertion:\n- %s\n\n", len(errs), strings.Join(errs, "\n- "))
 		graph := m.DrawGraph()
 		return false, fmt.Errorf("%s%s", errorReport, graph)
@@ -300,14 +400,9 @@ func (m *Spy) Happened(that ...*CalledFunc) (bool, error) {
 }
 
 // verifyExpectations checks each assertion against the recorded calls, consuming them if they match.
-func (m *Spy) verifyExpectations(calls, originalCalls map[string][][]any, assertions []*CalledFunc) []string {
+func (m *Spy) verifyExpectations(calls map[string][]*CallRecord, assertions []*CalledFunc) []string {
 	var errs []string
 	firstFailureSet := false
-
-	setFailure := func(assertion *CalledFunc, reason string) {
-		m.lastFailure = &failureRecord{failedAssertion: assertion, reason: reason}
-		firstFailureSet = true
-	}
 
 	for _, assertion := range assertions {
 		if assertion.err != nil {
@@ -319,11 +414,16 @@ func (m *Spy) verifyExpectations(calls, originalCalls map[string][][]any, assert
 		actualCount := len(matchingCalls)
 
 		if actualCount != assertion.times {
-			allCallsForFunc := originalCalls[assertion.funcName] // Use original calls for error reporting
+			// For error reporting, get all calls for this function name from the original map.
+			var allCallsForFunc [][]any
+			for _, call := range calls[assertion.funcName] {
+				allCallsForFunc = append(allCallsForFunc, call.Params)
+			}
 			errMsg := m.buildMismatchedCallError(assertion, actualCount, allCallsForFunc)
 			errs = append(errs, errMsg)
 			if !firstFailureSet {
-				setFailure(assertion, errMsg)
+				m.lastFailure = &failureRecord{failedAssertion: assertion, reason: errMsg}
+				firstFailureSet = true
 			}
 			// If the function was called but with the wrong parameters,
 			// consume those calls to prevent them from being reported as "unexpected".
@@ -345,23 +445,32 @@ func (m *Spy) verifyExpectations(calls, originalCalls map[string][][]any, assert
 }
 
 // checkUnexpectedCalls checks for any calls that were not consumed during verification.
-func (m *Spy) checkUnexpectedCalls(calls map[string][][]any) error {
+func (m *Spy) checkUnexpectedCalls(calls map[string][]*CallRecord) error {
 	unexpectedCount := 0
+	m.unexpectedCalls = make([]*CallRecord, 0)
 	var unexpectedDetails []string
-	for funcName, remainingCalls := range calls {
+	for _, remainingCalls := range calls {
 		if len(remainingCalls) > 0 {
-			unexpectedCount += len(remainingCalls)
-			unexpectedDetails = append(unexpectedDetails, fmt.Sprintf("  - %s was called %d time(s) unexpectedly with arguments: %v", funcName, len(remainingCalls), remainingCalls))
+			for _, call := range remainingCalls {
+				unexpectedCount++
+				nodeName := fmt.Sprintf("%s.%s", call.CalleeComponent, call.CalleeMethod)
+				boxLines := m.formatNodeAsLines(nodeName, call.Params)
+				// Make the box bold
+				boldBox := fmt.Sprintf("%s%s%s\n%s%s%s%s\n%s%s%s", bold, red, boxLines[0], bold, red, boxLines[1], reset, bold, red, boxLines[2])
+				unexpectedDetails = append(unexpectedDetails, boldBox)
+				m.unexpectedCalls = append(m.unexpectedCalls, call)
+			}
 		}
 	}
 	if unexpectedCount > 0 {
-		return fmt.Errorf("found %d unexpected call(s):\n%s", unexpectedCount, strings.Join(unexpectedDetails, "\n"))
+		return fmt.Errorf("found %d unexpected call(s):\n%s", unexpectedCount, strings.Join(unexpectedDetails, "\n\n"))
 	}
 	return nil
 }
 
 // buildMismatchedCallError creates a detailed error message for a failed assertion.
 func (m *Spy) buildMismatchedCallError(a *CalledFunc, actualCount int, allCallsForFunc [][]any) string {
+	cleanName := cleanFuncName(a.funcName)
 	if actualCount == 0 {
 		if len(allCallsForFunc) > 0 {
 			expectedArgsStr := "with any arguments"
@@ -373,14 +482,14 @@ func (m *Spy) buildMismatchedCallError(a *CalledFunc, actualCount int, allCallsF
 				fmt.Fprintf(&receivedCallsStr, "\n    - Call %d: %v", i+1, call)
 			}
 			return fmt.Sprintf("expected '%s' to be called %d time(s) %s, but it was called 0 times with those arguments. %d call(s) were recorded with the following arguments:%s",
-				cleanFuncName(a.funcName), a.times, expectedArgsStr, len(allCallsForFunc), receivedCallsStr.String())
+				cleanName, a.times, expectedArgsStr, len(allCallsForFunc), receivedCallsStr.String())
 		}
-		return fmt.Sprintf("expected '%s' to be called %d time(s), but it was not called.", a.funcName, a.times)
+		return fmt.Sprintf("expected '%s' to be called %d time(s), but it was not called.", cleanName, a.times)
 	}
-	return fmt.Sprintf("expected '%s' to be called %d time(s), but it was called %d time(s)", a.funcName, a.times, actualCount)
+	return fmt.Sprintf("expected '%s' to be called %d time(s), but it was called %d time(s)", cleanName, a.times, actualCount)
 }
 
-func (m *Spy) filterMatchingCalls(calls map[string][][]any, a *CalledFunc) [][]any {
+func (m *Spy) filterMatchingCalls(calls map[string][]*CallRecord, a *CalledFunc) []*CallRecord {
 	recordedCalls, found := calls[a.funcName]
 	if !found || len(recordedCalls) == 0 {
 		return nil
@@ -390,19 +499,19 @@ func (m *Spy) filterMatchingCalls(calls map[string][][]any, a *CalledFunc) [][]a
 		return recordedCalls
 	}
 
-	matchingCalls := make([][]any, 0)
+	matchingCalls := make([]*CallRecord, 0)
 	for _, call := range recordedCalls {
-		if paramsMatch(a.expectedArgs, call) {
+		if paramsMatch(a.expectedArgs, call.Params) {
 			matchingCalls = append(matchingCalls, call)
 		}
 	}
 	return matchingCalls
 }
 
-func (m *Spy) consumeCall(calls map[string][][]any, a *CalledFunc) {
+func (m *Spy) consumeCall(calls map[string][]*CallRecord, a *CalledFunc) {
 	allCalls := calls[a.funcName]
 	for i, call := range allCalls {
-		if paramsMatch(a.expectedArgs, call) {
+		if paramsMatch(a.expectedArgs, call.Params) {
 			// Remove the element at index i
 			calls[a.funcName] = append(allCalls[:i], allCalls[i+1:]...)
 			return
@@ -442,11 +551,26 @@ func splitFullFuncName(fullName string) (component, method string) {
 		return "Unknown", "Unknown"
 	}
 	fullName = strings.TrimSuffix(fullName, "-fm")
-	parts := strings.Split(fullName, ".")
-	methodName := parts[len(parts)-1]
-	componentPath := strings.Join(parts[:len(parts)-1], ".")
-	componentParts := strings.Split(componentPath, "/")
-	return strings.TrimPrefix(strings.TrimPrefix(componentParts[len(componentParts)-1], "("), "*"), methodName
+
+	// Find the last dot, which separates the method name from the type.
+	lastDotIndex := strings.LastIndex(fullName, ".")
+	if lastDotIndex == -1 {
+		return "Unknown", fullName // Should not happen with method calls
+	}
+
+	methodName := fullName[lastDotIndex+1:]
+	componentPath := fullName[:lastDotIndex] // e.g., "github.com/user/project/main.(*DogStub)"
+
+	// Find the last part of the path, which is the component name with package.
+	lastSlashIndex := strings.LastIndex(componentPath, "/")
+	componentWithPackage := componentPath[lastSlashIndex+1:] // e.g., "main.(*DogStub)"
+
+	// Clean up the component name by removing pointer indicators and parentheses.
+	componentName := strings.ReplaceAll(componentWithPackage, "(*", "")
+	componentName = strings.ReplaceAll(componentName, ")", "")
+	componentName = strings.ReplaceAll(componentName, "*", "")
+
+	return componentName, methodName
 }
 
 // --- Matchers ---
