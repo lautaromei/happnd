@@ -96,11 +96,64 @@ func (m *Spy) DrawGraph() string {
 		return "Call Graph: No calls recorded.\n"
 	}
 
-	// Build chains of calls
-	chains := m.buildCallChains()
+	var finalBuilder strings.Builder
+	finalBuilder.WriteString("Call Graph:\n\n")
 
+	// Group chains by their root caller to avoid duplicating the source node.
+	chainsByRoot := m.groupChainsByRoot()
+
+	for rootName, chains := range chainsByRoot {
+		// Create a set of unexpected calls for quick lookup.
+		unexpectedSet := make(map[*CallRecord]bool)
+		if m.unexpectedCalls != nil {
+			for _, uc := range m.unexpectedCalls {
+				unexpectedSet[uc] = true
+			}
+		}
+
+		// Count identical chains to keep the output clean
+		chainCounts := make(map[string]int)
+		uniqueChainKeys := make([]string, 0)
+		for _, chain := range chains {
+			// We pass `false` for `drawRoot` because we will draw it manually once.
+			key := m.chainToString(chain, unexpectedSet, false)
+			if _, exists := chainCounts[key]; !exists {
+				uniqueChainKeys = append(uniqueChainKeys, key)
+			}
+			chainCounts[key]++
+		}
+
+		// Draw the root node once.
+		rootBox := m.formatNodeAsLines(rootName, nil)
+		rootWidth := getVisibleLength(rootBox[1])
+		rootPadding := strings.Repeat(" ", rootWidth)
+		arrow := " --> "
+
+		for i, key := range uniqueChainKeys {
+			chainLines := strings.Split(key, "\n")
+			for lineIdx, line := range chainLines {
+				if i == 0 && lineIdx == 1 { // First chain, middle line
+					finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootBox[lineIdx], arrow, line))
+				} else if lineIdx == 1 { // Subsequent chains, middle line
+					finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootPadding, arrow, line))
+				} else { // Top and bottom lines of boxes
+					finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootPadding, strings.Repeat(" ", len(arrow)), line))
+				}
+			}
+			count := chainCounts[key]
+			if count > 1 {
+				finalBuilder.WriteString(fmt.Sprintf("%s%s(repeated %d times)\n", rootPadding, strings.Repeat(" ", len(arrow)), count))
+			}
+			finalBuilder.WriteString("\n")
+		}
+	}
+
+	return finalBuilder.String()
+}
+
+// Deprecated: This function is kept for compatibility but DrawGraph now handles chain counting.
+func (m *Spy) drawChains(chains [][]*CallRecord) string {
 	// Create a set of unexpected calls for quick lookup.
-	// These are populated during the Happened() check.
 	unexpectedSet := make(map[*CallRecord]bool)
 	if m.unexpectedCalls != nil {
 		for _, uc := range m.unexpectedCalls {
@@ -112,7 +165,7 @@ func (m *Spy) DrawGraph() string {
 	chainCounts := make(map[string]int)
 	uniqueChainKeys := make([]string, 0)
 	for _, chain := range chains {
-		key := m.chainToString(chain, unexpectedSet)
+		key := m.chainToString(chain, unexpectedSet, true)
 		if _, exists := chainCounts[key]; !exists {
 			uniqueChainKeys = append(uniqueChainKeys, key)
 		}
@@ -120,7 +173,6 @@ func (m *Spy) DrawGraph() string {
 	}
 
 	var finalBuilder strings.Builder
-	finalBuilder.WriteString("Call Graph:\n\n")
 
 	for _, key := range uniqueChainKeys {
 		count := chainCounts[key]
@@ -177,6 +229,20 @@ func (m *Spy) drawFailureDetails() string {
 	return builder.String()
 }
 
+func (m *Spy) groupChainsByRoot() map[string][][]*CallRecord {
+	chains := m.buildCallChains()
+	grouped := make(map[string][][]*CallRecord)
+
+	for _, chain := range chains {
+		if len(chain) > 0 {
+			rootCall := chain[0]
+			rootName := fmt.Sprintf("%s.%s", rootCall.CallerComponent, rootCall.CallerMethod)
+			grouped[rootName] = append(grouped[rootName], chain)
+		}
+	}
+	return grouped
+}
+
 func (m *Spy) buildCallChains() [][]*CallRecord {
 	chains := [][]*CallRecord{}
 	visited := make(map[*CallRecord]bool)
@@ -218,7 +284,7 @@ func (m *Spy) buildCallChains() [][]*CallRecord {
 	return chains
 }
 
-func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]bool) string {
+func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]bool, drawRoot bool) string {
 	if len(chain) == 0 {
 		return ""
 	}
@@ -233,11 +299,13 @@ func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]b
 	}
 
 	// The first node is the caller of the first call in the chain.
-	firstCall := chain[0]
-	callerName := fmt.Sprintf("%s.%s", firstCall.CallerComponent, firstCall.CallerMethod)
-	nodes = append(nodes, callerName)
-	nodeParams = append(nodeParams, nil) // The initial caller has no recorded params.
+	if drawRoot {
+		firstCall := chain[0]
+		callerName := fmt.Sprintf("%s.%s", firstCall.CallerComponent, firstCall.CallerMethod)
+		nodes = append(nodes, callerName)
+		nodeParams = append(nodeParams, nil) // The initial caller has no recorded params.
 
+	}
 	// Then, add all the subsequent callees.
 	for _, call := range chain {
 		isUnexpected := unexpectedSet[call]
@@ -245,10 +313,7 @@ func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]b
 		nodes = append(nodes, calleeName)
 		nodeParams = append(nodeParams, call.Params)
 
-		// If the call is unexpected, mark it in the graph.
 		if isUnexpected {
-			// We'll add the bold formatting when building the lines.
-			// For now, just add a marker to the node name.
 			nodes[len(nodes)-1] = fmt.Sprintf("%s%s%s%s", bold, red, nodes[len(nodes)-1], reset)
 		}
 	}
