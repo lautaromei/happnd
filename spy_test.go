@@ -175,3 +175,65 @@ func TestSpy_ClearAndTotalCalls(t *testing.T) {
 		t.Errorf("Expected 0 total calls after Clear(), but got %d", spy.TotalCalls())
 	}
 }
+
+// --- Structs for nested call with struct param test ---
+
+type CustomData struct {
+	ID   int
+	Name string
+}
+
+type InnerService struct {
+	spy *Spy
+}
+
+func (is *InnerService) ProcessData(data CustomData) {
+	is.spy.WatchCall(data)
+}
+
+type OuterService struct {
+	spy   *Spy
+	inner *InnerService
+}
+
+func (os *OuterService) PerformAction() {
+	os.spy.WatchCall() // Watch the outer call
+	data := CustomData{ID: 1, Name: "Test Data"}
+	os.inner.ProcessData(data)
+}
+
+func TestSpy_Happened_WithNestedCallAndStructParam(t *testing.T) {
+	spy := NewSpy()
+	inner := &InnerService{spy: spy}
+	outer := &OuterService{spy: spy, inner: inner}
+
+	t.Run("succeeds when nested call with struct param is expected correctly", func(t *testing.T) {
+		spy.Clear()
+
+		outer.PerformAction()
+
+		expectedData := CustomData{ID: 1, Name: "Test Data"}
+		ok, err := spy.Happened(
+			Called(outer.PerformAction).Once(),
+			Called(inner.ProcessData).WithParams(expectedData).Once(),
+		)
+
+		if !ok {
+			t.Errorf("Expected Happened to succeed, but it failed: %v", err)
+		}
+	})
+
+	t.Run("fails when struct param does not match", func(t *testing.T) {
+		spy.Clear()
+		outer.PerformAction()
+
+		wrongData := CustomData{ID: 99, Name: "Wrong Data"}
+		ok, _ := spy.Happened(
+			Called(inner.ProcessData).WithParams(wrongData).Once(),
+		)
+
+		if ok {
+			t.Error("Expected Happened to fail due to struct mismatch, but it succeeded")
+		}
+	})
+}
