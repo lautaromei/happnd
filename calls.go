@@ -15,9 +15,10 @@ func Called(function any) *CalledFunc {
 	}
 
 	fullName := runtime.FuncForPC(v.Pointer()).Name()
+	_, methodName := splitFullFuncName(fullName)
 	return &CalledFunc{
 		times:    1,
-		funcName: cleanFuncName(fullName),
+		funcName: methodName,
 	}
 }
 

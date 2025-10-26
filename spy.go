@@ -10,52 +10,122 @@ import (
 
 const Anything = "*"
 
+// CallRecord stores detailed information about a single function call.
+type CallRecord struct {
+	CallerComponent string
+	CallerMethod    string
+	CalleeComponent string
+	CalleeMethod    string
+	Params          []any
+}
+
 type Spy struct {
-	calls map[string][][]any
+	calls []*CallRecord
 	sync.RWMutex
 }
 
 func NewSpy() *Spy {
 	return &Spy{
-		calls: make(map[string][][]any),
+		calls: make([]*CallRecord, 0),
 	}
 }
 
 func (m *Spy) WatchCall(params ...any) {
-	pc, _, _, ok := runtime.Caller(1)
-	if !ok {
-		panic("Couldn't get the caller information")
+	pcs := make([]uintptr, 3)
+	// 0: runtime.Callers, 1: WatchCall, 2: Callee (e.g., DoWork), 3: Caller (e.g., Test function)
+	n := runtime.Callers(2, pcs)
+	if n < 1 {
+		panic("could not get caller information")
 	}
-	functionPath := cleanFuncName(runtime.FuncForPC(pc).Name())
+
+	calleeFrame, _ := runtime.CallersFrames(pcs[0:1]).Next()
+	calleeComponent, calleeMethod := splitFullFuncName(calleeFrame.Function)
+
+	callerComponent, callerMethod := "Test", "Unknown"
+	if n > 1 {
+		callerFrame, _ := runtime.CallersFrames(pcs[1:2]).Next()
+		callerComponent, callerMethod = splitFullFuncName(callerFrame.Function)
+	}
 
 	m.Lock()
 	defer m.Unlock()
-	m.calls[functionPath] = append(m.calls[functionPath], params)
+	m.calls = append(m.calls, &CallRecord{
+		CallerComponent: callerComponent,
+		CallerMethod:    callerMethod,
+		CalleeComponent: calleeComponent,
+		CalleeMethod:    calleeMethod,
+		Params:          params,
+	})
 }
 
 func (m *Spy) Clear() {
 	m.Lock()
 	defer m.Unlock()
-	m.calls = make(map[string][][]any)
+	m.calls = make([]*CallRecord, 0)
 }
 
 func (m *Spy) TotalCalls() int {
 	m.RLock()
 	defer m.RUnlock()
-	count := 0
-	for _, callsForFunc := range m.calls {
-		count += len(callsForFunc)
+	return len(m.calls)
+}
+
+// DrawGraph generates a string representation of the call graph.
+func (m *Spy) DrawGraph() string {
+	m.RLock()
+	defer m.RUnlock()
+
+	if len(m.calls) == 0 {
+		return "No calls recorded."
 	}
-	return count
+
+	var sb strings.Builder
+	sb.WriteString("Call Graph:\n")
+
+	// Use a map to count identical calls for a cleaner output
+	callCounts := make(map[string]int)
+	uniqueCalls := make([]string, 0)
+
+	for _, call := range m.calls {
+		// Normalize test function names for consistent output
+		callerMethod := call.CallerMethod
+		if strings.HasPrefix(callerMethod, "Test") {
+			callerMethod = "Test"
+		}
+
+		graphEntry := fmt.Sprintf("%s.%s -> %s.%s", call.CallerComponent, callerMethod, call.CalleeComponent, call.CalleeMethod)
+		if callCounts[graphEntry] == 0 {
+			uniqueCalls = append(uniqueCalls, graphEntry)
+		}
+		callCounts[graphEntry]++
+	}
+
+	for _, entry := range uniqueCalls {
+		count := callCounts[entry]
+		if count > 1 {
+			sb.WriteString(fmt.Sprintf("  %s (%d times)\n", entry, count))
+		} else {
+			sb.WriteString(fmt.Sprintf("  %s\n", entry))
+		}
+	}
+
+	return sb.String()
 }
 
 func (m *Spy) Happened(that ...*CalledFunc) (bool, error) {
 	m.RLock()
 	defer m.RUnlock()
 
-	// Create a mutable copy of the calls to work with.
-	copiedCalls := make(map[string][][]any, len(m.calls))
-	for funcName, calls := range m.calls {
+	// Group recorded calls by function name for efficient lookup.
+	callsByFunc := make(map[string][][]any)
+	for _, call := range m.calls {
+		funcName := cleanFuncName(call.CalleeMethod)
+		callsByFunc[funcName] = append(callsByFunc[funcName], call.Params)
+	}
+
+	// Create a mutable copy of the grouped calls to work with.
+	copiedCalls := make(map[string][][]any, len(callsByFunc))
+	for funcName, calls := range callsByFunc {
 		callsCopy := make([][]any, len(calls))
 		copy(callsCopy, calls)
 		copiedCalls[funcName] = callsCopy
@@ -199,6 +269,18 @@ func cleanFuncName(fullName string) string {
 	fullName = strings.TrimSuffix(fullName, "-fm")
 	parts := strings.Split(fullName, ".")
 	return parts[len(parts)-1]
+}
+
+func splitFullFuncName(fullName string) (component, method string) {
+	if fullName == "" {
+		return "Unknown", "Unknown"
+	}
+	fullName = strings.TrimSuffix(fullName, "-fm")
+	parts := strings.Split(fullName, ".")
+	methodName := parts[len(parts)-1]
+	componentPath := strings.Join(parts[:len(parts)-1], ".")
+	componentParts := strings.Split(componentPath, "/")
+	return strings.TrimPrefix(componentParts[len(componentParts)-1], "("), methodName
 }
 
 // --- Matchers ---
