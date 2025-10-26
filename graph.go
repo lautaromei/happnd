@@ -206,7 +206,15 @@ func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]b
 			isParamMismatchNode := failure.mismatchedCall != nil &&
 				fmt.Sprintf("%s.%s", failure.mismatchedCall.CalleeComponent, failure.mismatchedCall.CalleeMethod) == nodeName
 
-			isDirectFailureMatch := cleanFuncName(nodeName, stripPackage) == cleanFuncName(failure.failedAssertion.funcName, stripPackage)
+			var isDirectFailureMatch bool
+			if failure.failedAssertion.callerComponent != "" {
+				// Match full "Component.Method" for assertions made with Struct().Called()
+				expectedNodeName := fmt.Sprintf("%s.%s", failure.failedAssertion.callerComponent, failure.failedAssertion.funcName)
+				isDirectFailureMatch = cleanFuncName(nodeName, stripPackage) == cleanFuncName(expectedNodeName, stripPackage)
+			} else {
+				// Match just "Method" for assertions made with Called()
+				isDirectFailureMatch = strings.HasSuffix(cleanFuncName(nodeName, stripPackage), "."+failure.failedAssertion.funcName)
+			}
 
 			if isDirectFailureMatch || isParamMismatchNode {
 				reason := failure.reason
