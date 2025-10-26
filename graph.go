@@ -346,29 +346,32 @@ func (m *Spy) formatNodeAsLinesWithFailure(name string, failure *failureRecord, 
 	assertion := failure.failedAssertion
 	expectedParamsStr := formatArgs(assertion.expectedArgs)
 	actualStr := formatArgs(actualParams)
+	failureColor := red // Default to red for critical failures
 
-	var content string
+	var content, middleLine string
 	cleanNodeName := cleanFuncName(name, stripPackage)
 	if isCallerMismatch {
 		// Format: MyFunc(expected caller: A, actual: B)
-		content = fmt.Sprintf("%s(expected caller: %s, %sactual: %s%s)", cleanNodeName, assertion.callerComponent, green, actualCaller, reset)
+		content = fmt.Sprintf("%s(expected caller: %s, actual: %s)", cleanNodeName, assertion.callerComponent, actualCaller)
 	} else if isArgMismatch {
+		failureColor = yellow // Use yellow for parameter mismatches
 		// Format: MyFunc(expected: [1], actual: [2])
-		// The "actual" part will be colored green.
-		content = fmt.Sprintf("%s(expected: %s, %sactual: %s%s)", cleanNodeName, expectedParamsStr, green, actualStr, reset)
+		content = fmt.Sprintf("%s(expected: %s, %sactual: %s%s)", cleanNodeName, expectedParamsStr, green, actualStr, yellow)
 	} else if isCountMismatch {
+		failureColor = yellow // Use yellow for count mismatches
 		// Format: MyFunc(expected: 2, actual: 1)
-		content = fmt.Sprintf("%s(%sexpected: x%d%s, %sactual: x%d%s)", cleanNodeName, red, assertion.times, reset, green, failure.actualCount, reset)
+		content = fmt.Sprintf("%s(expected: x%d, %sactual: x%d%s)", cleanNodeName, assertion.times, green, failure.actualCount, yellow)
 	} else {
 		// Handle other failures, like wrong call count (e.g., Times(2) but called 1 time).
 		// The box will be red, indicating a failure on this node.
 		// This is a fallback, but isCountMismatch should catch most cases. Use the already cleaned name.
-		content = fmt.Sprintf("%s(%sexpected: x%d%s, %sactual: x%d%s)", cleanNodeName, red, assertion.times, reset, green, failure.actualCount, reset)
+		failureColor = yellow
+		content = fmt.Sprintf("%s(expected: x%d, %sactual: x%d%s)", cleanNodeName, assertion.times, green, failure.actualCount, yellow)
 	}
 
 	width := getVisibleLength(content) + 2 // +2 for padding
 	topLine := "." + strings.Repeat("-", width) + "."
-	middleLine := fmt.Sprintf("| %s%s%s%s |", bold, red, content, reset) // The whole box is red and bold
+	middleLine = fmt.Sprintf("| %s%s%s%s |", bold, failureColor, content, reset) // The whole box is colored based on failure type
 	bottomLine := "." + strings.Repeat("-", width) + "."
 
 	return []string{topLine, middleLine, bottomLine}
