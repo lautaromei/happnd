@@ -12,9 +12,11 @@ const Anything = "*"
 
 const (
 	// ANSI escape codes for styling console output.
-	bold  = "\033[1m"
-	red   = "\033[31m"
-	reset = "\033[0m"
+	bold   = "\033[1m"
+	red    = "\033[31m"
+	yellow = "\033[33m"
+	green  = "\033[32m"
+	reset  = "\033[0m"
 )
 
 // CallRecord stores detailed information about a single function call.
@@ -303,31 +305,25 @@ func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]b
 		nodeWidths = append(nodeWidths, getVisibleLength(boxLines[1]))
 
 		// If this node is the one that failed the assertion, add failure details.
-		if failureAnnotation != nil && i > 0 && strings.Contains(nodeName, failureAnnotation.failedAssertion.funcName) {
-			var failureText string
-			expectedCaller := failureAnnotation.failedAssertion.callerComponent
-			// Check if the failure was due to a caller mismatch.
-			if expectedCaller != "" {
-				actualCaller := chain[i-1].CallerComponent
-				failureText = fmt.Sprintf("expected caller '%s', but was '%s'", expectedCaller, actualCaller)
-			} else {
-				// Otherwise, it's an argument mismatch.
-				expectedArgsStr := formatArgs(failureAnnotation.failedAssertion.expectedArgs)
-				actualArgsStr := formatArgs(params)
-				failureText = fmt.Sprintf("it expected %s, got %s", expectedArgsStr, actualArgsStr)
+		if failureAnnotation != nil && cleanFuncName(nodeName) == failureAnnotation.failedAssertion.funcName {
+			// This node corresponds to the failed assertion. Check if it's an argument mismatch.
+			reason := failureAnnotation.reason
+			isArgMismatch := strings.Contains(reason, "different arguments")
+			isCallerMismatch := strings.Contains(reason, "called by")
+
+			var actualCaller string
+			if isCallerMismatch {
+				// Find the actual call record to get the real caller
+				for _, call := range m.calls {
+					if call.CalleeMethod == failureAnnotation.failedAssertion.funcName {
+						actualCaller = call.CallerComponent
+						break
+					}
+				}
 			}
 
-			// Add the failure annotation as a new line below the box.
-
-			// Calculate padding to center the annotation under its box.
-			boxWidth := nodeWidths[i]
-			annotationWidth := len(failureText)
-			padding := (boxWidth - annotationWidth) / 2
-			if padding < 0 {
-				padding = 0
-			}
-			paddingStr := strings.Repeat(" ", padding)
-			lines[i] = append(lines[i], fmt.Sprintf("%s%s%s%s%s", paddingStr, bold, red, failureText, reset))
+			// Re-format the node to show expected vs actual.
+			lines[i] = m.formatNodeAsLinesWithFailure(nodeName, failureAnnotation.failedAssertion, params, isArgMismatch, isCallerMismatch, actualCaller)
 		}
 	}
 
@@ -406,13 +402,42 @@ func (m *Spy) formatNodeAsLines(name string, params []any) []string {
 	return []string{topLine, middleLine, bottomLine}
 }
 
+func (m *Spy) formatNodeAsLinesWithFailure(name string, assertion *CalledFunc, actualParams []any, isArgMismatch, isCallerMismatch bool, actualCaller string) []string {
+	expectedParamsStr := formatArgs(assertion.expectedArgs)
+	actualStr := formatArgs(actualParams)
+
+	var content string
+	if isCallerMismatch {
+		// Format: MyFunc(expected caller: A, actual: B)
+		content = fmt.Sprintf("%s(expected caller: %s, %sactual: %s%s)", cleanFuncName(name), assertion.callerComponent, green, actualCaller, reset)
+	} else if isArgMismatch {
+		// Format: MyFunc(expected: [1], actual: [2])
+		// The "actual" part will be colored green.
+		content = fmt.Sprintf("%s(expected: %s, %sactual: %s%s)", cleanFuncName(name), expectedParamsStr, green, actualStr, reset)
+	} else {
+		// Handle other failures, like wrong call count (e.g., Times(2) but called 1 time).
+		// The box will be red, indicating a failure on this node.
+		content = fmt.Sprintf("%s%s", cleanFuncName(name), formatArgs(actualParams))
+	}
+
+	width := getVisibleLength(content) + 2 // +2 for padding
+	topLine := "." + strings.Repeat("-", width) + "."
+	middleLine := fmt.Sprintf("| %s%s%s%s |", bold, red, content, reset) // The whole box is red and bold
+	bottomLine := "." + strings.Repeat("-", width) + "."
+
+	return []string{topLine, middleLine, bottomLine}
+}
+
+// getVisibleLength calculates the visible length of a string by stripping ANSI codes
 // getVisibleLength calculates the visible length of a string by stripping ANSI codes.
 func getVisibleLength(s string) int {
 	// A simple way to strip ANSI codes is to remove them with a regex,
 	// but for this specific case, we can just replace the known codes.
+	s = strings.ReplaceAll(s, green, "")
 	s = strings.ReplaceAll(s, bold, "")
 	s = strings.ReplaceAll(s, red, "")
 	s = strings.ReplaceAll(s, reset, "")
+	s = strings.ReplaceAll(s, yellow, "")
 	return len(s)
 }
 
