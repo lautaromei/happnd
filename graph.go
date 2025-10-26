@@ -15,16 +15,20 @@ const (
 )
 
 // DrawGraph generates a sequential, ASCII-based representation of the call graph.
-func (m *Spy) DrawGraph() string {
+func (m *Spy) DrawGraph(commonPackage string) string {
 	m.RLock()
 	defer m.RUnlock()
 
 	if len(m.calls) == 0 {
-		return "Call Graph: No calls recorded.\n"
+		return "Call Graph: No calls recorded."
 	}
 
 	var finalBuilder strings.Builder
-	finalBuilder.WriteString("Call Graph:\n\n")
+	if commonPackage != "" {
+		finalBuilder.WriteString(fmt.Sprintf("Call Graph (package: %s):\n\n", commonPackage))
+	} else {
+		finalBuilder.WriteString("Call Graph:\n\n")
+	}
 
 	// Group chains by their root caller to avoid duplicating the source node.
 	chainsByRoot := m.groupChainsByRoot()
@@ -43,7 +47,7 @@ func (m *Spy) DrawGraph() string {
 		uniqueChainKeys := make([]string, 0)
 		for _, chain := range chains {
 			// We pass `false` for `drawRoot` because we will draw it manually once.
-			key := m.chainToString(chain, unexpectedSet, false, 1) // count is 1 for now
+			key := m.chainToString(chain, unexpectedSet, false, 1, commonPackage != "") // count is 1 for now
 			if _, exists := chainCounts[key]; !exists {
 				uniqueChainKeys = append(uniqueChainKeys, key)
 			}
@@ -51,7 +55,7 @@ func (m *Spy) DrawGraph() string {
 		}
 
 		// Draw the root node once.
-		rootBox := m.formatNodeAsLines(rootName, nil, false, 1)
+		rootBox := m.formatNodeAsLines(rootName, nil, false, 1, commonPackage != "")
 		arrow := " --> "
 
 		for i, chainKey := range uniqueChainKeys {
@@ -61,8 +65,8 @@ func (m *Spy) DrawGraph() string {
 			if count > 1 {
 				// Find the original chain to re-render it. This is a bit inefficient but works.
 				for _, chain := range chains {
-					if m.chainToString(chain, unexpectedSet, false, 1) == chainKey {
-						chainStr = m.chainToString(chain, unexpectedSet, false, count)
+					if m.chainToString(chain, unexpectedSet, false, 1, commonPackage != "") == chainKey {
+						chainStr = m.chainToString(chain, unexpectedSet, false, count, commonPackage != "")
 						break
 					}
 				}
@@ -157,7 +161,7 @@ func (m *Spy) drawChain(builder *strings.Builder, rootBox, chainLines []string, 
 	}
 }
 
-func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]bool, drawRoot bool, count int) string {
+func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]bool, drawRoot bool, count int, stripPackage bool) string {
 	if len(chain) == 0 {
 		return ""
 	}
@@ -191,14 +195,20 @@ func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]b
 	for i, nodeName := range nodes {
 		isLastNode := (i == len(nodes)-1)
 		params := nodeParams[i]
-		boxLines := m.formatNodeAsLines(nodeName, params, isLastNode, count)
+		boxLines := m.formatNodeAsLines(nodeName, params, isLastNode, count, stripPackage)
 		lines = append(lines, boxLines)
 		nodeWidths = append(nodeWidths, getVisibleLength(boxLines[1]))
 
 		// If this node is the one that failed the assertion, add failure details.
 		for _, failure := range m.failures {
-			if cleanFuncName(nodeName) == failure.failedAssertion.funcName {
-				// This node corresponds to a failed assertion. Check if it's an argument mismatch.
+			// Check if the current node in the graph matches the failed assertion.
+			// This can be a direct name match or a parameter mismatch where the call itself is the one that failed.
+			isParamMismatchNode := failure.mismatchedCall != nil &&
+				fmt.Sprintf("%s.%s", failure.mismatchedCall.CalleeComponent, failure.mismatchedCall.CalleeMethod) == nodeName
+
+			isDirectFailureMatch := cleanFuncName(nodeName, stripPackage) == cleanFuncName(failure.failedAssertion.funcName, stripPackage)
+
+			if isDirectFailureMatch || isParamMismatchNode {
 				reason := failure.reason
 				isArgMismatch := strings.Contains(reason, "different arguments")
 				isCallerMismatch := strings.Contains(reason, "called by")
@@ -216,7 +226,7 @@ func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]b
 				}
 
 				// Re-format the node to show expected vs actual.
-				lines[i] = m.formatNodeAsLinesWithFailure(nodeName, failure, params, isArgMismatch, isCallerMismatch, isCountMismatch, actualCaller)
+				lines[i] = m.formatNodeAsLinesWithFailure(nodeName, failure, params, isArgMismatch, isCallerMismatch, isCountMismatch, actualCaller, stripPackage)
 				break // A node can only have one failure annotation.
 			}
 		}
@@ -264,7 +274,7 @@ func formatArgs(args []any) string {
 	return fmt.Sprintf("%v", args)
 }
 
-func (m *Spy) formatNodeAsLines(name string, params []any, isLastNode bool, count int) []string {
+func (m *Spy) formatNodeAsLines(name string, params []any, isLastNode bool, count int, stripPackage bool) []string {
 	var paramsStr string
 	if params != nil {
 		var paramParts []string
@@ -288,6 +298,16 @@ func (m *Spy) formatNodeAsLines(name string, params []any, isLastNode bool, coun
 		}
 	}
 
+	// The user wants to see only the method name in bold for successful calls.
+	// We need to check if this node is associated with any failure.
+	isFailureNode := false
+	for _, failure := range m.failures {
+		if cleanFuncName(name, stripPackage) == cleanFuncName(failure.failedAssertion.funcName, stripPackage) {
+			isFailureNode = true
+			break
+		}
+	}
+
 	multiplier := ""
 	if isLastNode && count > 1 {
 		multiplier = fmt.Sprintf(" (%sx%d%s)", yellow, count, reset)
@@ -295,34 +315,47 @@ func (m *Spy) formatNodeAsLines(name string, params []any, isLastNode bool, coun
 
 	content := fmt.Sprintf("%s%s%s", name, paramsStr, multiplier) // name might already be bold
 	width := getVisibleLength(content) + 2                        // +2 for padding
-	topLine := "." + strings.Repeat("-", width) + "."
+
+	// If it's not a failure node and not an unexpected call, bold just the method name.
+	if !isFailureNode && !strings.HasPrefix(name, bold) {
+		// Split "Struct.Method" into "Struct" and "Method"
+		structAndMethod := cleanFuncName(name, stripPackage)
+		lastDot := strings.LastIndex(structAndMethod, ".")
+		structName := structAndMethod[:lastDot+1] // "Struct."
+		methodName := structAndMethod[lastDot+1:] // "Method"
+
+		content = fmt.Sprintf("%s%s%s%s%s%s", structName, bold, methodName, reset, paramsStr, multiplier)
+		width = getVisibleLength(content) + 2
+	}
+	topLine := "." + strings.Repeat("-", width) + "." // Recalculate width in case content changed
 	middleLine := fmt.Sprintf("| %s |", content)
 	bottomLine := "." + strings.Repeat("-", width) + "."
 
 	return []string{topLine, middleLine, bottomLine}
 }
 
-func (m *Spy) formatNodeAsLinesWithFailure(name string, failure *failureRecord, actualParams []any, isArgMismatch, isCallerMismatch, isCountMismatch bool, actualCaller string) []string {
+func (m *Spy) formatNodeAsLinesWithFailure(name string, failure *failureRecord, actualParams []any, isArgMismatch, isCallerMismatch, isCountMismatch bool, actualCaller string, stripPackage bool) []string {
 	assertion := failure.failedAssertion
 	expectedParamsStr := formatArgs(assertion.expectedArgs)
 	actualStr := formatArgs(actualParams)
 
 	var content string
+	cleanNodeName := cleanFuncName(name, stripPackage)
 	if isCallerMismatch {
 		// Format: MyFunc(expected caller: A, actual: B)
-		content = fmt.Sprintf("%s(expected caller: %s, %sactual: %s%s)", cleanFuncName(name), assertion.callerComponent, green, actualCaller, reset)
+		content = fmt.Sprintf("%s(expected caller: %s, %sactual: %s%s)", cleanNodeName, assertion.callerComponent, green, actualCaller, reset)
 	} else if isArgMismatch {
 		// Format: MyFunc(expected: [1], actual: [2])
 		// The "actual" part will be colored green.
-		content = fmt.Sprintf("%s(expected: %s, %sactual: %s%s)", cleanFuncName(name), expectedParamsStr, green, actualStr, reset)
+		content = fmt.Sprintf("%s(expected: %s, %sactual: %s%s)", cleanNodeName, expectedParamsStr, green, actualStr, reset)
 	} else if isCountMismatch {
 		// Format: MyFunc(expected: 2, actual: 1)
-		content = fmt.Sprintf("%s(%sexpected: x%d%s, %sactual: x%d%s)", cleanFuncName(name), red, assertion.times, reset, green, failure.actualCount, reset)
+		content = fmt.Sprintf("%s(%sexpected: x%d%s, %sactual: x%d%s)", cleanNodeName, red, assertion.times, reset, green, failure.actualCount, reset)
 	} else {
 		// Handle other failures, like wrong call count (e.g., Times(2) but called 1 time).
 		// The box will be red, indicating a failure on this node.
-		// This is a fallback, but isCountMismatch should catch most cases.
-		content = fmt.Sprintf("%s(%sexpected: x%d%s, %sactual: x%d%s)", cleanFuncName(name), red, assertion.times, reset, green, failure.actualCount, reset)
+		// This is a fallback, but isCountMismatch should catch most cases. Use the already cleaned name.
+		content = fmt.Sprintf("%s(%sexpected: x%d%s, %sactual: x%d%s)", cleanNodeName, red, assertion.times, reset, green, failure.actualCount, reset)
 	}
 
 	width := getVisibleLength(content) + 2 // +2 for padding

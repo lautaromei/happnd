@@ -28,6 +28,7 @@ type failureRecord struct {
 	failedAssertion *CalledFunc
 	reason          string
 	actualCount     int // Add actual count for better graph annotations
+	mismatchedCall  *CallRecord
 }
 
 type Spy struct {
@@ -121,12 +122,46 @@ func (m *Spy) Happened(that ...*CalledFunc) (bool, error) {
 		// On failure, generate the graph and include it in the error.
 		// The graph drawing logic will automatically include failure annotations if `m.lastFailure` was set.
 
-		graph := m.DrawGraph()
+		// Check if all calls belong to the same package to simplify the graph.
+		commonPackage, allSame := m.checkAndGetCommonPackage()
+		var graph string
+		if allSame {
+			graph = m.DrawGraph(commonPackage)
+		} else {
+			graph = m.DrawGraph("") // Pass empty string if packages are mixed
+		}
 		errorReport := fmt.Sprintf("\nfound %d error(s) during expectation assertion:\n- %s", len(errs), strings.Join(errs, "\n- "))
 		return false, fmt.Errorf("%s%s", graph, errorReport)
 	}
 
 	return true, nil
+}
+
+// checkAndGetCommonPackage iterates through all recorded calls to see if they share a single common package.
+func (m *Spy) checkAndGetCommonPackage() (string, bool) {
+	if len(m.calls) == 0 {
+		return "", true // No calls, so vacuously true.
+	}
+
+	var commonPackage string
+
+	// Helper to extract package from a component name like "main.MyStruct"
+	getPackage := func(componentName string) string {
+		parts := strings.Split(componentName, ".")
+		if len(parts) > 1 {
+			return parts[0]
+		}
+		return "" // No package found
+	}
+
+	commonPackage = getPackage(m.calls[0].CalleeComponent)
+
+	for _, call := range m.calls {
+		if getPackage(call.CalleeComponent) != commonPackage || getPackage(call.CallerComponent) != commonPackage {
+			return "", false // Found a different package
+		}
+	}
+	return commonPackage, true
 }
 
 // verifyExpectations checks each assertion against the recorded calls, consuming them if they match.
@@ -148,7 +183,7 @@ func (m *Spy) verifyExpectations(calls map[string][]*CallRecord, assertions []*C
 			// For error reporting, get all calls for this function name from the original map.
 			errMsg := m.buildMismatchedCallError(assertion, actualCount, allCallsForFunc)
 			errs = append(errs, errMsg)
-			m.failures = append(m.failures, &failureRecord{failedAssertion: assertion, reason: errMsg, actualCount: actualCount})
+			m.addFailure(assertion, errMsg, actualCount, allCallsForFunc)
 			// If the function was called but with the wrong parameters,
 			// consume those calls to prevent them from being reported as "unexpected".
 			if actualCount == 0 && len(allCallsForFunc) > 0 {
@@ -164,6 +199,20 @@ func (m *Spy) verifyExpectations(calls map[string][]*CallRecord, assertions []*C
 		}
 	}
 	return errs
+}
+
+func (m *Spy) addFailure(a *CalledFunc, reason string, actualCount int, allCallsForFunc []*CallRecord) {
+	failure := &failureRecord{
+		failedAssertion: a,
+		reason:          reason,
+		actualCount:     actualCount,
+	}
+	// If it's a parameter mismatch, find the first call that was mismatched to annotate it in the graph.
+	if actualCount == 0 && len(allCallsForFunc) > 0 {
+		failure.mismatchedCall = allCallsForFunc[0]
+	}
+
+	m.failures = append(m.failures, failure)
 }
 
 // checkUnexpectedCalls checks for any calls that were not consumed during verification.
@@ -191,7 +240,7 @@ func (m *Spy) checkUnexpectedCalls(calls map[string][]*CallRecord) error {
 
 // buildMismatchedCallError creates a detailed error message for a failed assertion.
 func (m *Spy) buildMismatchedCallError(a *CalledFunc, actualCount int, allRecordedCallsForFunc []*CallRecord) string {
-	cleanName := cleanFuncName(a.funcName)
+	cleanName := a.funcName // We don't clean it here to keep package info for the text error
 	if actualCount == 0 {
 		if len(allRecordedCallsForFunc) > 0 {
 			// If a specific caller was expected, the error is about the caller mismatch.
@@ -327,10 +376,15 @@ func paramsMatch(expected, actual []any) bool {
 	return true
 }
 
-func cleanFuncName(fullName string) string {
+func cleanFuncName(fullName string, stripPackage bool) string {
 	fullName = strings.TrimSuffix(fullName, "-fm")
-	parts := strings.Split(fullName, ".")
-	return parts[len(parts)-1]
+	if stripPackage {
+		parts := strings.Split(fullName, ".")
+		if len(parts) > 1 {
+			return strings.Join(parts[1:], ".") // Keep struct and method, remove package
+		}
+	}
+	return fullName
 }
 
 func splitFullFuncName(fullName string) (component, method string) {
@@ -352,12 +406,10 @@ func splitFullFuncName(fullName string) (component, method string) {
 	lastSlashIndex := strings.LastIndex(componentPath, "/")
 	componentWithPackage := componentPath[lastSlashIndex+1:] // e.g., "main.(*DogStub)"
 
-	// Clean up the component name by removing pointer indicators and parentheses.
-	componentName := strings.ReplaceAll(componentWithPackage, "(*", "")
-	componentName = strings.ReplaceAll(componentName, ")", "")
-	componentName = strings.ReplaceAll(componentName, "*", "")
-
-	return componentName, methodName
+	// Keep the component name with package, but clean up pointer indicators.
+	componentWithPackage = strings.ReplaceAll(componentWithPackage, "(*", "")
+	componentWithPackage = strings.ReplaceAll(componentWithPackage, ")", "")
+	return componentWithPackage, methodName
 }
 
 // --- Matchers ---
