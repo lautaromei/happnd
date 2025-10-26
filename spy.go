@@ -130,16 +130,22 @@ func (m *Spy) DrawGraph() string {
 		for i, key := range uniqueChainKeys {
 			chainLines := strings.Split(key, "\n")
 			rootPadding := strings.Repeat(" ", getVisibleLength(rootBox[1]))
+			rootMidLineIndex := 1 // The middle line of a standard box is at index 1
 			arrowPadding := strings.Repeat(" ", len(arrow))
+
 			for lineIdx, line := range chainLines {
+				currentArrow := arrowPadding
+				if lineIdx == rootMidLineIndex {
+					currentArrow = arrow
+				}
 				// For the first chain, draw the root box completely.
 				if i == 0 {
 					if lineIdx < len(rootBox) {
-						finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootBox[lineIdx], arrow, line))
+						finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootBox[lineIdx], currentArrow, line))
 					} else {
-						finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootPadding, arrow, line))
+						finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootPadding, currentArrow, line))
 					}
-				} else if lineIdx == 1 { // For subsequent chains, just draw the middle line with an arrow from the root's vertical space.
+				} else if lineIdx == rootMidLineIndex { // For subsequent chains, just draw the middle line with an arrow from the root's vertical space.
 					finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootPadding, arrow, line))
 				} else { // Top and bottom lines of boxes
 					finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootPadding, arrowPadding, line))
@@ -149,42 +155,6 @@ func (m *Spy) DrawGraph() string {
 			if count > 1 {
 				finalBuilder.WriteString(fmt.Sprintf("%s%s(repeated %d times)\n", rootPadding, strings.Repeat(" ", len(arrow)), count))
 			}
-			finalBuilder.WriteString("\n")
-		}
-	}
-
-	return finalBuilder.String()
-}
-
-// Deprecated: This function is kept for compatibility but DrawGraph now handles chain counting.
-func (m *Spy) drawChains(chains [][]*CallRecord) string {
-	// Create a set of unexpected calls for quick lookup.
-	unexpectedSet := make(map[*CallRecord]bool)
-	if m.unexpectedCalls != nil {
-		for _, uc := range m.unexpectedCalls {
-			unexpectedSet[uc] = true
-		}
-	}
-
-	// Count identical chains to keep the output clean
-	chainCounts := make(map[string]int)
-	uniqueChainKeys := make([]string, 0)
-	for _, chain := range chains {
-		key := m.chainToString(chain, unexpectedSet, true)
-		if _, exists := chainCounts[key]; !exists {
-			uniqueChainKeys = append(uniqueChainKeys, key)
-		}
-		chainCounts[key]++
-	}
-
-	var finalBuilder strings.Builder
-
-	for _, key := range uniqueChainKeys {
-		count := chainCounts[key]
-		if count > 1 {
-			finalBuilder.WriteString(fmt.Sprintf("%s\n(repeated %d times)\n\n", key, count))
-		} else {
-			finalBuilder.WriteString(fmt.Sprintf("%s\n\n", key))
 		}
 	}
 
@@ -478,9 +448,9 @@ func (m *Spy) Happened(that ...*CalledFunc) (bool, error) {
 		// On failure, generate the graph and include it in the error.
 		// The graph drawing logic will automatically include failure annotations if `m.lastFailure` was set.
 
-		errorReport := fmt.Sprintf("found %d error(s) during expectation assertion:\n- %s\n\n", len(errs), strings.Join(errs, "\n- "))
 		graph := m.DrawGraph()
-		return false, fmt.Errorf("%s%s", errorReport, graph)
+		errorReport := fmt.Sprintf("\nfound %d error(s) during expectation assertion:\n- %s", len(errs), strings.Join(errs, "\n- "))
+		return false, fmt.Errorf("%s%s", graph, errorReport)
 	}
 
 	return true, nil
