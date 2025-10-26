@@ -45,26 +45,30 @@ func NewSpy() *Spy {
 }
 
 func (m *Spy) WatchCall(params ...any) {
-	pcs := make([]uintptr, 3)
-	// 0: runtime.Callers, 1: WatchCall, 2: Callee (e.g., DoWork), 3: Caller (e.g., Test function)
+	// We look up to 5 frames up the stack to find the test function.
+	// 0: runtime.Callers, 1: WatchCall, 2: Callee (e.g., DoWork), 3: Caller (e.g., Test function or another method)
+	pcs := make([]uintptr, 5)
 	n := runtime.Callers(2, pcs)
 	if n < 1 {
 		panic("could not get caller information")
 	}
 
-	calleeFrame, _ := runtime.CallersFrames(pcs[0:1]).Next()
+	frames := runtime.CallersFrames(pcs[:n])
+	calleeFrame, _ := frames.Next() // This is the function that called WatchCall
+	callerFrame, _ := frames.Next() // This is the immediate caller of the callee
+
 	calleeComponent, calleeMethod := splitFullFuncName(calleeFrame.Function)
+	callerComponent, callerMethod := splitFullFuncName(callerFrame.Function)
 
-	var callerComponent, callerMethod string
-	if n > 1 {
-		callerFrame, _ := runtime.CallersFrames(pcs[1:2]).Next()
-		callerComponent, callerMethod = splitFullFuncName(callerFrame.Function)
-	} else {
+	// If the immediate caller is not a test function, it might be a method called by the test.
+	// We walk up the stack to find the actual test function that initiated the call chain.
+	if !strings.HasPrefix(callerMethod, "Test") {
+		nextFrame, more := frames.Next()
+		if more && strings.HasPrefix(splitFullFuncName(nextFrame.Function)) {
+			callerComponent, callerMethod = splitFullFuncName(nextFrame.Function)
+		}
+	} else if n < 2 {
 		callerComponent, callerMethod = "Unknown", "Unknown"
-	}
-
-	if strings.HasPrefix(callerMethod, "Test") {
-		// This is the root call from a test. The component is the test package itself.
 	}
 
 	m.Lock()
