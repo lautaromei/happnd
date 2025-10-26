@@ -125,19 +125,24 @@ func (m *Spy) DrawGraph() string {
 
 		// Draw the root node once.
 		rootBox := m.formatNodeAsLines(rootName, nil)
-		rootWidth := getVisibleLength(rootBox[1])
-		rootPadding := strings.Repeat(" ", rootWidth)
 		arrow := " --> "
 
 		for i, key := range uniqueChainKeys {
 			chainLines := strings.Split(key, "\n")
+			rootPadding := strings.Repeat(" ", getVisibleLength(rootBox[1]))
+			arrowPadding := strings.Repeat(" ", len(arrow))
 			for lineIdx, line := range chainLines {
-				if i == 0 && lineIdx == 1 { // First chain, middle line
-					finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootBox[lineIdx], arrow, line))
-				} else if lineIdx == 1 { // Subsequent chains, middle line
+				// For the first chain, draw the root box completely.
+				if i == 0 {
+					if lineIdx < len(rootBox) {
+						finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootBox[lineIdx], arrow, line))
+					} else {
+						finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootPadding, arrow, line))
+					}
+				} else if lineIdx == 1 { // For subsequent chains, just draw the middle line with an arrow from the root's vertical space.
 					finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootPadding, arrow, line))
 				} else { // Top and bottom lines of boxes
-					finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootPadding, strings.Repeat(" ", len(arrow)), line))
+					finalBuilder.WriteString(fmt.Sprintf("%s%s%s\n", rootPadding, arrowPadding, line))
 				}
 			}
 			count := chainCounts[key]
@@ -328,12 +333,21 @@ func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]b
 		nodeWidths = append(nodeWidths, getVisibleLength(boxLines[1]))
 
 		// If this node is the one that failed the assertion, add failure details.
-		if failureAnnotation != nil && strings.Contains(nodeName, failureAnnotation.failedAssertion.funcName) {
-			expectedArgsStr := fmt.Sprintf("%v", failureAnnotation.failedAssertion.expectedArgs)
-			actualArgsStr := fmt.Sprintf("%v", params)
+		if failureAnnotation != nil && i > 0 && strings.Contains(nodeName, failureAnnotation.failedAssertion.funcName) {
+			var failureText string
+			expectedCaller := failureAnnotation.failedAssertion.callerComponent
+			// Check if the failure was due to a caller mismatch.
+			if expectedCaller != "" {
+				actualCaller := chain[i-1].CallerComponent
+				failureText = fmt.Sprintf("expected caller '%s', but was '%s'", expectedCaller, actualCaller)
+			} else {
+				// Otherwise, it's an argument mismatch.
+				expectedArgsStr := formatArgs(failureAnnotation.failedAssertion.expectedArgs)
+				actualArgsStr := formatArgs(params)
+				failureText = fmt.Sprintf("it expected %s, got %s", expectedArgsStr, actualArgsStr)
+			}
 
 			// Add the failure annotation as a new line below the box.
-			failureText := fmt.Sprintf("it expected %s, got %s", expectedArgsStr, actualArgsStr)
 
 			// Calculate padding to center the annotation under its box.
 			boxWidth := nodeWidths[i]
@@ -381,6 +395,14 @@ func (m *Spy) chainToString(chain []*CallRecord, unexpectedSet map[*CallRecord]b
 	return result.String()
 }
 
+// formatArgs is a helper to display arguments, showing "(no arguments)" for empty slices.
+func formatArgs(args []any) string {
+	if len(args) == 0 {
+		return "(no arguments)"
+	}
+	return fmt.Sprintf("%v", args)
+}
+
 func (m *Spy) formatNodeAsLines(name string, params []any) []string {
 	var paramsStr string
 	if params != nil {
@@ -409,7 +431,7 @@ func (m *Spy) formatNodeAsLines(name string, params []any) []string {
 	width := getVisibleLength(content) + 2          // +2 for padding
 	topLine := "." + strings.Repeat("-", width) + "."
 	middleLine := fmt.Sprintf("| %s |", content)
-	bottomLine := "'" + strings.Repeat("-", width) + "'"
+	bottomLine := "." + strings.Repeat("-", width) + "."
 
 	return []string{topLine, middleLine, bottomLine}
 }
@@ -480,10 +502,7 @@ func (m *Spy) verifyExpectations(calls map[string][]*CallRecord, assertions []*C
 
 		if actualCount != assertion.times {
 			// For error reporting, get all calls for this function name from the original map.
-			var allCallsForFunc [][]any
-			for _, call := range calls[assertion.funcName] {
-				allCallsForFunc = append(allCallsForFunc, call.Params)
-			}
+			allCallsForFunc := calls[assertion.funcName]
 			errMsg := m.buildMismatchedCallError(assertion, actualCount, allCallsForFunc)
 			errs = append(errs, errMsg)
 			if !firstFailureSet {
@@ -534,19 +553,39 @@ func (m *Spy) checkUnexpectedCalls(calls map[string][]*CallRecord) error {
 }
 
 // buildMismatchedCallError creates a detailed error message for a failed assertion.
-func (m *Spy) buildMismatchedCallError(a *CalledFunc, actualCount int, allCallsForFunc [][]any) string {
+func (m *Spy) buildMismatchedCallError(a *CalledFunc, actualCount int, allCallsForFunc []*CallRecord) string {
 	cleanName := cleanFuncName(a.funcName)
 	if actualCount == 0 {
 		if len(allCallsForFunc) > 0 {
+			// If a specific caller was expected, the error should be about the caller mismatch.
+			if a.callerComponent != "" {
+				callersFound := make(map[string]bool)
+				for _, call := range allCallsForFunc {
+					callersFound[call.CallerComponent] = true
+				}
+				var foundCallerNames []string
+				for name := range callersFound {
+					foundCallerNames = append(foundCallerNames, fmt.Sprintf("'%s'", name))
+				}
+				return fmt.Sprintf("expected '%s' to be called by '%s', but it was called by %s instead.",
+					cleanName, a.callerComponent, strings.Join(foundCallerNames, ", "))
+			}
+
+			// Otherwise, the error is about mismatched arguments.
 			expectedArgsStr := "with any arguments"
 			if len(a.expectedArgs) > 0 {
 				expectedArgsStr = fmt.Sprintf("with arguments %v", a.expectedArgs)
 			}
+
 			var receivedCallsStr strings.Builder
 			for i, call := range allCallsForFunc {
-				fmt.Fprintf(&receivedCallsStr, "\n    - Call %d: %v", i+1, call)
+				if len(call.Params) == 0 {
+					fmt.Fprintf(&receivedCallsStr, "\n    - Call %d: (no arguments)", i+1)
+				} else {
+					fmt.Fprintf(&receivedCallsStr, "\n    - Call %d: %v", i+1, call.Params)
+				}
 			}
-			return fmt.Sprintf("expected '%s' to be called %d time(s) %s, but it was called 0 times with those arguments. %d call(s) were recorded with the following arguments:%s",
+			return fmt.Sprintf("expected '%s' to be called %d time(s) %s, but it was called 0 times with those arguments. %d call(s) were recorded with different arguments:%s",
 				cleanName, a.times, expectedArgsStr, len(allCallsForFunc), receivedCallsStr.String())
 		}
 		return fmt.Sprintf("expected '%s' to be called %d time(s), but it was not called.", cleanName, a.times)
@@ -560,17 +599,37 @@ func (m *Spy) filterMatchingCalls(calls map[string][]*CallRecord, a *CalledFunc)
 		return nil
 	}
 
-	if len(a.expectedArgs) == 0 {
-		return recordedCalls
+	// Start with all recorded calls for the function.
+	matchingCalls := recordedCalls
+
+	// If a specific caller is expected, filter by it first.
+	if a.callerComponent != "" {
+		matchingCalls = filterByCaller(matchingCalls, a.callerComponent)
 	}
 
-	matchingCalls := make([]*CallRecord, 0)
-	for _, call := range recordedCalls {
-		if paramsMatch(a.expectedArgs, call.Params) {
-			matchingCalls = append(matchingCalls, call)
+	// If specific arguments are expected, filter by them.
+	if len(a.expectedArgs) > 0 {
+		var paramMatchingCalls []*CallRecord
+		for _, call := range matchingCalls {
+			if paramsMatch(a.expectedArgs, call.Params) {
+				paramMatchingCalls = append(paramMatchingCalls, call)
+			}
 		}
+		matchingCalls = paramMatchingCalls
 	}
 	return matchingCalls
+}
+
+// filterByCaller filters a slice of CallRecords, returning only those made by the specified callerComponent.
+func filterByCaller(calls []*CallRecord, callerComponent string) []*CallRecord {
+	var filtered []*CallRecord
+	for _, call := range calls {
+		// call.CallerComponent is in the format "main.DogWalker"
+		if call.CallerComponent == callerComponent {
+			filtered = append(filtered, call)
+		}
+	}
+	return filtered
 }
 
 func (m *Spy) consumeCall(calls map[string][]*CallRecord, a *CalledFunc) {
